@@ -39,6 +39,7 @@ LOCAL_APPS = [
     "apps.reports",
     "apps.audit",
     "apps.notifications",
+    "apps.safex",
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -70,7 +71,10 @@ DATABASES = {
         "PASSWORD": config("DB_PASSWORD"),
         "HOST":     config("DB_HOST"),
         "PORT":     config("DB_PORT"),
-        "CONN_MAX_AGE": 60,
+        "OPTIONS": {
+            "sslmode": "require",
+        },
+        "CONN_MAX_AGE": 0,
     }
 }
 
