@@ -1,4 +1,4 @@
-# Dashboard Backend — Complete Implementation Roadmap (A → Z)
+# Dashboard Backend — Complete Implementation Roadmap (A → Z) (was completed except last step (docker step))
 
 > Follow every step in order. Each phase produces working, testable code before moving on.  
 > **Never skip a phase.** Later phases depend on earlier ones compiling and passing tests.
@@ -8,6 +8,7 @@
 ## PHASE 0 — Local Environment & Tooling
 
 ### Step 0.1 — Python & Virtual Environment
+
 ```bash
 python --version          # Must be 3.11+
 python -m venv .venv
@@ -16,6 +17,7 @@ pip install --upgrade pip
 ```
 
 ### Step 0.2 — Project Initialization
+
 ```bash
 mkdir dashboard-backend && cd dashboard-backend
 git init
@@ -24,6 +26,7 @@ django-admin startproject config .
 ```
 
 ### Step 0.3 — Create the Full Directory Skeleton
+
 ```bash
 # Apps
 mkdir -p apps/{authentication,users,analytics,reports,audit,notifications}
@@ -67,6 +70,7 @@ touch .env .env.example .gitignore pytest.ini manage.py
 ```
 
 ### Step 0.4 — .gitignore
+
 ```gitignore
 .venv/
 __pycache__/
@@ -84,6 +88,7 @@ dist/
 ```
 
 ### Step 0.5 — .env & .env.example
+
 ```env
 # .env (never commit this file)
 DJANGO_SETTINGS_MODULE=config.settings.development
@@ -118,6 +123,7 @@ SENTRY_DSN=
 ## PHASE 1 — Requirements & Dependencies
 
 ### Step 1.1 — requirements/base.txt
+
 ```
 Django==5.0.6
 djangorestframework==3.15.2
@@ -143,6 +149,7 @@ pydantic==2.7.1
 ```
 
 ### Step 1.2 — requirements/development.txt
+
 ```
 -r base.txt
 pytest==8.2.2
@@ -155,6 +162,7 @@ ipython==8.25.0
 ```
 
 ### Step 1.3 — requirements/production.txt
+
 ```
 -r base.txt
 whitenoise==6.7.0
@@ -163,6 +171,7 @@ boto3==1.34.130
 ```
 
 ### Step 1.4 — Install & Verify
+
 ```bash
 pip install -r requirements/development.txt
 python -c "import django; print(django.__version__)"  # must print 5.0.6
@@ -173,6 +182,7 @@ python -c "import django; print(django.__version__)"  # must print 5.0.6
 ## PHASE 2 — Settings Architecture
 
 ### Step 2.1 — config/settings/base.py
+
 ```python
 from pathlib import Path
 from decouple import config
@@ -356,6 +366,7 @@ LOGGING = {
 ```
 
 ### Step 2.2 — config/settings/development.py
+
 ```python
 from .base import *
 
@@ -374,6 +385,7 @@ EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 ```
 
 ### Step 2.3 — config/settings/production.py
+
 ```python
 from .base import *
 
@@ -401,6 +413,7 @@ sentry_sdk.init(dsn=config("SENTRY_DSN", default=""), traces_sample_rate=0.2)
 ```
 
 ### Step 2.4 — config/settings/testing.py
+
 ```python
 from .base import *
 
@@ -418,6 +431,7 @@ PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
 ```
 
 ### Step 2.5 — pytest.ini
+
 ```ini
 [pytest]
 DJANGO_SETTINGS_MODULE = config.settings.testing
@@ -428,6 +442,7 @@ addopts = --strict-markers --tb=short -v
 ```
 
 ### Step 2.6 — Verify Settings Load
+
 ```bash
 python manage.py check --settings=config.settings.development
 ```
@@ -439,6 +454,7 @@ python manage.py check --settings=config.settings.development
 > Build this before any app. Every app imports from `core/`.
 
 ### Step 3.1 — core/renderers.py
+
 ```python
 from rest_framework.renderers import JSONRenderer
 import json
@@ -461,6 +477,7 @@ class StandardJSONRenderer(JSONRenderer):
 ```
 
 ### Step 3.2 — core/exceptions.py
+
 ```python
 from rest_framework.views import exception_handler
 from rest_framework.response import Response
@@ -484,6 +501,7 @@ def global_exception_handler(exc, context):
 ```
 
 ### Step 3.3 — core/pagination.py
+
 ```python
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
@@ -510,6 +528,7 @@ class StandardResultsPagination(PageNumberPagination):
 ```
 
 ### Step 3.4 — core/mixins.py
+
 ```python
 from rest_framework.response import Response
 from rest_framework import status
@@ -531,6 +550,7 @@ class SoftDeleteMixin:
 ```
 
 ### Step 3.5 — core/utils.py
+
 ```python
 import hashlib, uuid
 
@@ -547,6 +567,7 @@ def generate_uuid() -> str:
 ## PHASE 4 — Root URL Configuration
 
 ### Step 4.1 — config/urls.py
+
 ```python
 from django.contrib import admin
 from django.urls import path, include
@@ -574,6 +595,7 @@ if settings.DEBUG:
 > **Must be done before any migration.** Changing AUTH_USER_MODEL after the first migration is painful.
 
 ### Step 5.1 — apps/users/models.py
+
 ```python
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin, BaseUserManager
 from django.db import models
@@ -630,6 +652,7 @@ class User(AbstractBaseUser, PermissionsMixin):
 ```
 
 ### Step 5.2 — apps/users/apps.py
+
 ```python
 from django.apps import AppConfig
 
@@ -640,6 +663,7 @@ class UsersConfig(AppConfig):
 ```
 
 ### Step 5.3 — apps/users/permissions.py
+
 ```python
 from rest_framework.permissions import BasePermission
 
@@ -659,6 +683,7 @@ class IsAnalystOrAbove(BasePermission):
 ```
 
 ### Step 5.4 — apps/users/services.py
+
 ```python
 from django.core.cache import cache
 from .models import User
@@ -685,6 +710,7 @@ class UserService:
 ```
 
 ### Step 5.5 — apps/users/api/serializers.py
+
 ```python
 from rest_framework import serializers
 from apps.users.models import User
@@ -705,6 +731,7 @@ class UserUpdateSerializer(serializers.ModelSerializer):
 ```
 
 ### Step 5.6 — apps/users/api/views.py
+
 ```python
 from rest_framework import generics, permissions
 from apps.users.models import User
@@ -739,6 +766,7 @@ class UserDetailView(generics.RetrieveUpdateAPIView):
 ```
 
 ### Step 5.7 — apps/users/api/urls.py
+
 ```python
 from django.urls import path
 from . import views
@@ -751,6 +779,7 @@ urlpatterns = [
 ```
 
 ### Step 5.8 — Run First Migration
+
 ```bash
 python manage.py makemigrations users
 python manage.py migrate
@@ -762,6 +791,7 @@ python manage.py createsuperuser
 ## PHASE 6 — Authentication App (JWT)
 
 ### Step 6.1 — apps/authentication/services.py
+
 ```python
 from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -795,6 +825,7 @@ class AuthService:
 ```
 
 ### Step 6.2 — apps/authentication/api/serializers.py
+
 ```python
 from rest_framework import serializers
 
@@ -811,6 +842,7 @@ class ChangePasswordSerializer(serializers.Serializer):
 ```
 
 ### Step 6.3 — apps/authentication/api/views.py
+
 ```python
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -856,6 +888,7 @@ class ChangePasswordView(APIView):
 ```
 
 ### Step 6.4 — apps/authentication/api/urls.py
+
 ```python
 from django.urls import path
 from rest_framework_simplejwt.views import TokenRefreshView
@@ -870,6 +903,7 @@ urlpatterns = [
 ```
 
 ### Step 6.5 — Test Auth Manually
+
 ```bash
 python manage.py runserver
 # POST http://localhost:8000/api/v1/auth/login/
@@ -881,6 +915,7 @@ python manage.py runserver
 ## PHASE 7 — Celery Setup
 
 ### Step 7.1 — config/celery.py
+
 ```python
 import os
 from celery import Celery
@@ -896,13 +931,15 @@ def debug_task(self):
     print(f"Request: {self.request!r}")
 ```
 
-### Step 7.2 — config/__init__.py
+### Step 7.2 — config/**init**.py
+
 ```python
 from .celery import app as celery_app
 __all__ = ("celery_app",)
 ```
 
 ### Step 7.3 — Verify Celery
+
 ```bash
 # Terminal 1: Redis
 docker run -p 6379:6379 redis
@@ -919,6 +956,7 @@ celery -A config beat -l info
 ## PHASE 8 — Audit App (Security Logging)
 
 ### Step 8.1 — apps/audit/models.py
+
 ```python
 from django.db import models
 from django.conf import settings
@@ -945,6 +983,7 @@ class AuditLog(models.Model):
 ```
 
 ### Step 8.2 — apps/audit/middleware.py
+
 ```python
 import uuid
 from .models import AuditLog
@@ -983,6 +1022,7 @@ class AuditLogMiddleware:
 ```
 
 ### Step 8.3 — Migrate Audit
+
 ```bash
 python manage.py makemigrations audit
 python manage.py migrate
@@ -993,6 +1033,7 @@ python manage.py migrate
 ## PHASE 9 — Analytics App
 
 ### Step 9.1 — apps/analytics/models.py
+
 ```python
 from django.db import models
 from django.conf import settings
@@ -1013,6 +1054,7 @@ class Metric(models.Model):
 ```
 
 ### Step 9.2 — apps/analytics/cache.py
+
 ```python
 from django.core.cache import cache
 
@@ -1026,6 +1068,7 @@ def invalidate_dashboard_cache(user_id: str):
 ```
 
 ### Step 9.3 — apps/analytics/services.py
+
 ```python
 from django.core.cache import cache
 from django.db.models import Avg, Sum, Count
@@ -1058,6 +1101,7 @@ class AnalyticsService:
 ```
 
 ### Step 9.4 — apps/analytics/tasks.py
+
 ```python
 from celery import shared_task
 from .cache import invalidate_dashboard_cache
@@ -1071,6 +1115,7 @@ def refresh_dashboard_metrics(self):
 ```
 
 ### Step 9.5 — apps/analytics/api/views.py
+
 ```python
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -1086,6 +1131,7 @@ class DashboardMetricsView(APIView):
 ```
 
 ### Step 9.6 — apps/analytics/api/urls.py
+
 ```python
 from django.urls import path
 from . import views
@@ -1096,6 +1142,7 @@ urlpatterns = [
 ```
 
 ### Step 9.7 — Migrate Analytics
+
 ```bash
 python manage.py makemigrations analytics
 python manage.py migrate
@@ -1106,6 +1153,7 @@ python manage.py migrate
 ## PHASE 10 — Reports App
 
 ### Step 10.1 — apps/reports/models.py
+
 ```python
 from django.db import models
 from django.conf import settings
@@ -1141,6 +1189,7 @@ class Report(models.Model):
 ```
 
 ### Step 10.2 — apps/reports/tasks.py
+
 ```python
 from celery import shared_task
 import logging
@@ -1170,6 +1219,7 @@ def generate_report(self, report_id: str):
 ```
 
 ### Step 10.3 — apps/reports/api/views.py
+
 ```python
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
@@ -1198,6 +1248,7 @@ class ReportDetailView(generics.RetrieveDestroyAPIView):
 ```
 
 ### Step 10.4 — Migrate Reports
+
 ```bash
 python manage.py makemigrations reports
 python manage.py migrate
@@ -1208,6 +1259,7 @@ python manage.py migrate
 ## PHASE 11 — Notifications App
 
 ### Step 11.1 — apps/notifications/models.py
+
 ```python
 from django.db import models
 from django.conf import settings
@@ -1235,6 +1287,7 @@ class Notification(models.Model):
 ```
 
 ### Step 11.2 — apps/notifications/tasks.py
+
 ```python
 from celery import shared_task
 from django.core.mail import send_mail
@@ -1258,6 +1311,7 @@ def send_email_notification(user_id: str, subject: str, message: str):
 ## PHASE 12 — Testing Suite
 
 ### Step 12.1 — Factory Classes (apps/users/tests/factories.py)
+
 ```python
 import factory
 from factory.django import DjangoModelFactory
@@ -1279,6 +1333,7 @@ class UserFactory(DjangoModelFactory):
 ```
 
 ### Step 12.2 — Example View Test (apps/authentication/tests/test_views.py)
+
 ```python
 import pytest
 from django.urls import reverse
@@ -1306,6 +1361,7 @@ class TestLoginView:
 ```
 
 ### Step 12.3 — Run Tests
+
 ```bash
 pytest --cov=apps --cov-report=html
 open htmlcov/index.html   # review coverage report
@@ -1313,9 +1369,12 @@ open htmlcov/index.html   # review coverage report
 
 ---
 
+#### SKIP PHASE 13 FOR NOW
+
 ## PHASE 13 — Docker & Infrastructure
 
 ### Step 13.1 — infrastructure/docker/Dockerfile
+
 ```dockerfile
 FROM python:3.11-slim
 
@@ -1341,6 +1400,7 @@ ENTRYPOINT ["/entrypoint.sh"]
 ```
 
 ### Step 13.2 — infrastructure/docker/entrypoint.sh
+
 ```bash
 #!/bin/sh
 set -e
@@ -1355,6 +1415,7 @@ exec gunicorn config.wsgi:application \
 ```
 
 ### Step 13.3 — infrastructure/docker-compose.yml
+
 ```yaml
 version: "3.9"
 
@@ -1362,8 +1423,8 @@ services:
   db:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB:       ${DB_NAME}
-      POSTGRES_USER:     ${DB_USER}
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -1431,6 +1492,7 @@ volumes:
 ```
 
 ### Step 13.4 — infrastructure/nginx/nginx.conf
+
 ```nginx
 events { worker_connections 1024; }
 
@@ -1504,6 +1566,7 @@ curl -X POST https://yourdomain.com/api/v1/auth/login/ \
 ```
 
 ### Final Go-Live Checklist
+
 - [ ] All env vars set in production environment (no hardcoded secrets)
 - [ ] `DEBUG=False` in production
 - [ ] `ALLOWED_HOSTS` set explicitly
@@ -1524,21 +1587,24 @@ curl -X POST https://yourdomain.com/api/v1/auth/login/ \
 
 ## Summary: Implementation Timeline
 
-| Phase | What You Build | Blocker For |
-|---|---|---|
-| 0 | Folder scaffold, .env, git | Everything |
-| 1 | Requirements files | Package availability |
-| 2 | Settings (base/dev/prod/test) | DB connection, all apps |
-| 3 | Core utilities (renderer, exceptions, pagination) | All API responses |
-| 4 | Root URL config | All endpoints |
-| 5 | Users app + custom User model | **First migration** · Auth |
-| 6 | Authentication app (JWT) | All protected endpoints |
-| 7 | Celery + Redis setup | All async tasks |
-| 8 | Audit middleware + model | Security logging |
-| 9 | Analytics app | Dashboard data |
-| 10 | Reports app | Export features |
-| 11 | Notifications app | Alerts & emails |
-| 12 | Full test suite | Confidence to deploy |
-| 13 | Docker + Nginx | Production deployment |
-| 14 | Verification & go-live | Launch |
+| Phase | What You Build                                    | Blocker For                |
+| ----- | ------------------------------------------------- | -------------------------- |
+| 0     | Folder scaffold, .env, git                        | Everything                 |
+| 1     | Requirements files                                | Package availability       |
+| 2     | Settings (base/dev/prod/test)                     | DB connection, all apps    |
+| 3     | Core utilities (renderer, exceptions, pagination) | All API responses          |
+| 4     | Root URL config                                   | All endpoints              |
+| 5     | Users app + custom User model                     | **First migration** · Auth |
+| 6     | Authentication app (JWT)                          | All protected endpoints    |
+| 7     | Celery + Redis setup                              | All async tasks            |
+| 8     | Audit middleware + model                          | Security logging           |
+| 9     | Analytics app                                     | Dashboard data             |
+| 10    | Reports app                                       | Export features            |
+| 11    | Notifications app                                 | Alerts & emails            |
+| 12    | Full test suite                                   | Confidence to deploy       |
+| 13    | Docker + Nginx                                    | Production deployment      |
+| 14    | Verification & go-live                            | Launch                     |
+
+```
+
 ```
