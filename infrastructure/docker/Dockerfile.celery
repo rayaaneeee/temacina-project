@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+FROM python:3.11-slim AS base
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential gcc libpq-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Non‑root user
+RUN useradd --create-home appuser
+WORKDIR /home/appuser
+USER appuser
+
+# Builder stage (reuse same virtualenv as API)
+FROM base AS builder
+ENV VIRTUAL_ENV=/home/appuser/.venv
+RUN python -m venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Install Poetry (optional – you can use pip directly)
+ENV POETRY_VERSION=1.8.2
+RUN curl -sSL https://install.python-poetry.org | python - && \
+    ln -s $HOME/.local/bin/poetry /usr/local/bin/poetry
+
+COPY --chown=appuser pyproject.toml poetry.lock ./
+RUN poetry config virtualenvs.create false && \
+    poetry install --no-interaction --no-ansi --only main
+
+COPY --chown=appuser . .
+
+# Runtime
+FROM base AS runtime
+ENV VIRTUAL_ENV=/home/appuser/.venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+COPY --from=builder $VIRTUAL_ENV $VIRTUAL_ENV
+COPY --from=builder /home/appuser/.local $HOME/.local
+
+ENV DJANGO_SETTINGS_MODULE=config.settings.production
+ENV PYTHONUNBUFFERED=1
+
+# Command to run Celery worker – entrypoint will be provided by docker‑compose
+CMD ["celery", "-A", "config.celery", "worker", "-l", "info"]

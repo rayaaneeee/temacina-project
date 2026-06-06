@@ -10,6 +10,7 @@ urlpatterns = [
     path("api/v1/analytics/",     include("apps.analytics.api.urls")),
     path("api/v1/reports/",       include("apps.reports.api.urls")),
     path("api/v1/notifications/", include("apps.notifications.api.urls")),
+    path("api/v1/", include("apps.safex.api.urls")),
 ]
 
 if settings.DEBUG:
