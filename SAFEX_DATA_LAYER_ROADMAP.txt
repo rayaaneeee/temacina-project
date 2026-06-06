@@ -1,0 +1,2849 @@
+# Temacina Dashboard — Django Data Layer Roadmap
+# Schema: Safex2022_2030 | Database: Neon PostgreSQL
+# ============================================================
+# IMPORTANT: All models use managed = False because tables
+# already exist on Neon. Django will read them but never
+# try to CREATE / ALTER / DROP them.
+# ============================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 1 — APP STRUCTURE (done)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Create one Django app to hold all Safex domain models:
+
+    python manage.py startapp safex
+
+Add it to INSTALLED_APPS in config/settings/base.py:
+
+    LOCAL_APPS = [
+        ...
+        "apps.safex",
+    ]
+
+Final structure:
+
+    apps/safex/
+    ├── __init__.py
+    ├── apps.py
+    ├── models.py          ← all 32 models
+    ├── admin.py
+    ├── services/
+    │   ├── __init__.py
+    │   ├── company.py     ← company queries & filters
+    │   ├── trade_show.py  ← trade show queries
+    │   ├── analytics.py   ← dashboard KPI queries
+    │   └── search.py      ← cross-entity search
+    ├── api/
+    │   ├── __init__.py
+    │   ├── serializers.py
+    │   ├── views.py
+    │   ├── filters.py     ← django-filter FilterSets
+    │   └── urls.py
+    └── tests/
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 2 — DJANGO MODELS  (apps/safex/models.py) (done)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# ── apps/safex/models.py ─────────────────────────────────────
+
+from django.db import models
+
+
+# ════════════════════════════════════════════════════════════
+# LOOKUP / REFERENCE TABLES
+# ════════════════════════════════════════════════════════════
+
+class TradeShow(models.Model):
+    """
+    One edition of a trade show, uniquely identified by (name, exhibition_year).
+    exhibition_year must be between 2022 and 2030.
+    """
+    name            = models.CharField(max_length=255)
+    exhibition_year = models.IntegerField()
+    venue_name      = models.CharField(max_length=255, null=True, blank=True)
+    city            = models.CharField(max_length=255, null=True, blank=True)
+    country         = models.CharField(max_length=255, null=True, blank=True)
+    metadata        = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        managed  = False
+        db_table = "trade_shows"
+        unique_together = [("name", "exhibition_year")]
+        ordering = ["-exhibition_year", "name"]
+        indexes  = [models.Index(fields=["exhibition_year"])]
+
+    def __str__(self):
+        return f"{self.name} ({self.exhibition_year})"
+
+
+class Sector(models.Model):
+    """
+    Allowed values: Industry, Agriculture, Construction, ITech, Others.
+    """
+    title = models.CharField(max_length=255, unique=True)
+
+    class Meta:
+        managed  = False
+        db_table = "sectors"
+        ordering = ["title"]
+
+    def __str__(self):
+        return self.title
+
+
+class DocumentType(models.Model):
+    """
+    Allowed codes: CARTE_VISITE, CATALOGUE, ANNUAIRE, FLYER, MAGAZINE.
+    """
+    code  = models.CharField(max_length=50, unique=True)
+    label = models.CharField(max_length=255, unique=True)
+
+    class Meta:
+        managed  = False
+        db_table = "document_types"
+
+    def __str__(self):
+        return self.label
+
+
+class PhoneType(models.Model):
+    """
+    Allowed codes: FIX, FAX, MOBILE, WHATSAPP, WECHAT, TELEGRAM.
+    """
+    code  = models.CharField(max_length=50, unique=True)
+    label = models.CharField(max_length=255, unique=True)
+
+    class Meta:
+        managed  = False
+        db_table = "phone_types"
+
+    def __str__(self):
+        return self.label
+
+
+class SocialNetworkType(models.Model):
+    """
+    Allowed codes: X, TIKTOK, INSTAGRAM, FACEBOOK, YOUTUBE, LINKEDIN.
+    """
+    code  = models.CharField(max_length=50, unique=True)
+    label = models.CharField(max_length=255, unique=True)
+
+    class Meta:
+        managed  = False
+        db_table = "social_network_types"
+
+    def __str__(self):
+        return self.label
+
+
+class Language(models.Model):
+    language = models.CharField(max_length=100, null=True, blank=True)
+
+    class Meta:
+        managed  = False
+        db_table = "languages"
+
+    def __str__(self):
+        return self.language or str(self.id)
+
+
+# ════════════════════════════════════════════════════════════
+# CORE BUSINESS ENTITIES
+# ════════════════════════════════════════════════════════════
+
+class Company(models.Model):
+    """
+    Source-of-truth business entity.
+    A company can appear in multiple trade shows (via company_docs → documents → trade_shows).
+    """
+    legal_name            = models.CharField(max_length=255, unique=True)
+    normalized_legal_name = models.CharField(max_length=255, null=True, blank=True)
+    logo                  = models.CharField(max_length=500, null=True, blank=True)
+    metadata              = models.JSONField(null=True, blank=True)
+
+    # Many-to-many relationships (declared here for ORM convenience)
+    sectors      = models.ManyToManyField(Sector,      through="CompanySector",
+                                          related_name="companies")
+    phones       = models.ManyToManyField("Phone",     through="CompanyPhone",
+                                          related_name="companies")
+    emails       = models.ManyToManyField("Email",     through="CompanyEmail",
+                                          related_name="companies")
+    websites     = models.ManyToManyField("Website",   through="CompanyWebsite",
+                                          related_name="companies")
+    documents    = models.ManyToManyField("Document",  through="CompanyDoc",
+                                          related_name="companies")
+    social_networks = models.ManyToManyField(
+        "SocialNetworkAccount",
+        through="CompanySocialNetwork",
+        related_name="companies",
+    )
+
+    class Meta:
+        managed  = False
+        db_table = "companies"
+        ordering = ["legal_name"]
+        indexes  = [
+            models.Index(fields=["legal_name"]),
+            models.Index(fields=["normalized_legal_name"]),
+        ]
+
+    def __str__(self):
+        return self.legal_name
+
+
+class CompanyContact(models.Model):
+    company    = models.ForeignKey(Company, on_delete=models.CASCADE,
+                                   related_name="contacts")
+    first_name = models.CharField(max_length=255)
+    last_name  = models.CharField(max_length=255, null=True, blank=True)
+    role       = models.CharField(max_length=255, null=True, blank=True)
+    metadata   = models.JSONField(null=True, blank=True)
+
+    phones  = models.ManyToManyField("Phone",  through="CompanyContactPhone",
+                                      related_name="contact_owners")
+    emails  = models.ManyToManyField("Email",  through="CompanyContactEmail",
+                                      related_name="contact_owners")
+    social_networks = models.ManyToManyField(
+        "SocialNetworkAccount",
+        through="CompanyContactSocialNetwork",
+        related_name="contact_owners",
+    )
+
+    class Meta:
+        managed  = False
+        db_table = "company_contacts"
+        unique_together = [("company", "first_name", "last_name", "role")]
+        indexes = [
+            models.Index(fields=["company"]),
+            models.Index(fields=["last_name"]),
+            models.Index(fields=["role"]),
+        ]
+
+    def __str__(self):
+        return f"{self.first_name} {self.last_name or ''} @ {self.company}"
+
+
+class CompanyAddress(models.Model):
+    company     = models.ForeignKey(Company, on_delete=models.CASCADE,
+                                    related_name="addresses")
+    street      = models.CharField(max_length=500, null=True, blank=True)
+    postal_code = models.CharField(max_length=20,  null=True, blank=True)
+    city        = models.CharField(max_length=255,  null=True, blank=True)
+    country     = models.CharField(max_length=255)
+    metadata    = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        managed  = False
+        db_table = "company_addresses"
+        unique_together = [("company", "street", "postal_code", "city", "country")]
+        indexes = [
+            models.Index(fields=["company"]),
+            models.Index(fields=["city", "country"]),
+        ]
+
+    def __str__(self):
+        return f"{self.city}, {self.country}"
+
+
+class CompanyDescription(models.Model):
+    """
+    A company can have many descriptions extracted from different documents.
+    """
+    company                 = models.ForeignKey(Company,    on_delete=models.CASCADE,
+                                                related_name="descriptions")
+    document                = models.ForeignKey("Document", on_delete=models.CASCADE,
+                                                related_name="company_descriptions")
+    description             = models.TextField()
+    normalized_description  = models.TextField(null=True, blank=True)
+    metadata                = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        managed  = False
+        db_table = "company_descriptions"
+        indexes  = [
+            models.Index(fields=["company"]),
+            models.Index(fields=["document"]),
+            models.Index(fields=["company", "document"]),
+        ]
+
+
+class CompanyProfileCache(models.Model):
+    """
+    Read model / pre-computed JSON profile for fast dashboard rendering.
+    Cache only — not the source of truth.
+    """
+    company          = models.OneToOneField(Company, on_delete=models.CASCADE,
+                                            primary_key=True, related_name="profile_cache")
+    profile_json     = models.JSONField()
+    last_refreshed_at = models.DateTimeField()
+
+    class Meta:
+        managed  = False
+        db_table = "company_profile_cache"
+        indexes  = [models.Index(fields=["last_refreshed_at"])]
+
+
+# ════════════════════════════════════════════════════════════
+# CONTACT DATA ENTITIES
+# ════════════════════════════════════════════════════════════
+
+class Phone(models.Model):
+    country_dial_code        = models.CharField(max_length=10,  null=True, blank=True)
+    phone_number             = models.CharField(max_length=50)
+    full_phone_number        = models.CharField(max_length=60,  null=True, blank=True)
+    normalized_phone_number  = models.CharField(max_length=60,  null=True, blank=True)
+    phone_type               = models.ForeignKey(PhoneType, on_delete=models.PROTECT,
+                                                 related_name="phones")
+    metadata                 = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        managed  = False
+        db_table = "phones"
+        unique_together = [("full_phone_number", "phone_type")]
+        indexes = [
+            models.Index(fields=["phone_number"]),
+            models.Index(fields=["full_phone_number"]),
+            models.Index(fields=["normalized_phone_number"]),
+            models.Index(fields=["phone_type"]),
+        ]
+
+    def __str__(self):
+        return self.full_phone_number or self.phone_number
+
+
+class Email(models.Model):
+    email_address            = models.EmailField(unique=True)
+    normalized_email_address = models.CharField(max_length=255, null=True, blank=True)
+    is_professional          = models.BooleanField()
+    metadata                 = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        managed  = False
+        db_table = "emails"
+        indexes  = [
+            models.Index(fields=["email_address"]),
+            models.Index(fields=["normalized_email_address"]),
+            models.Index(fields=["is_professional"]),
+        ]
+
+    def __str__(self):
+        return self.email_address
+
+
+class Website(models.Model):
+    url            = models.URLField(unique=True, max_length=500)
+    normalized_url = models.CharField(max_length=500, null=True, blank=True)
+    website_type   = models.CharField(max_length=50, null=True, blank=True)
+    description    = models.TextField(null=True, blank=True)
+    metadata       = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        managed  = False
+        db_table = "websites"
+        indexes  = [
+            models.Index(fields=["url"]),
+            models.Index(fields=["normalized_url"]),
+            models.Index(fields=["website_type"]),
+        ]
+
+    def __str__(self):
+        return self.url
+
+
+class SocialNetworkAccount(models.Model):
+    social_network_type    = models.ForeignKey(SocialNetworkType, on_delete=models.PROTECT,
+                                               related_name="accounts")
+    account_value          = models.CharField(max_length=255)
+    normalized_account_value = models.CharField(max_length=255, null=True, blank=True)
+    profile_url            = models.URLField(max_length=500, null=True, blank=True)
+    metadata               = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        managed  = False
+        db_table = "social_network_accounts"
+        unique_together = [("social_network_type", "account_value")]
+        indexes = [
+            models.Index(fields=["social_network_type"]),
+            models.Index(fields=["account_value"]),
+            models.Index(fields=["normalized_account_value"]),
+        ]
+
+    def __str__(self):
+        return f"{self.social_network_type.code}: {self.account_value}"
+
+
+# ════════════════════════════════════════════════════════════
+# DOCUMENT ENTITIES
+# ════════════════════════════════════════════════════════════
+
+class Document(models.Model):
+    trade_show       = models.ForeignKey(TradeShow,    on_delete=models.PROTECT,
+                                         related_name="documents")
+    document_type    = models.ForeignKey(DocumentType, on_delete=models.PROTECT,
+                                         related_name="documents")
+    file_name        = models.CharField(max_length=500, null=True, blank=True)
+    file_hash        = models.CharField(max_length=64,  unique=True, null=True, blank=True)
+    page_count       = models.IntegerField(null=True, blank=True)
+    ingestion_status = models.CharField(max_length=50,  null=True, blank=True)
+    ingested_at      = models.DateTimeField(null=True, blank=True)
+    ocr_engine_version = models.CharField(max_length=50, null=True, blank=True)
+    metadata         = models.JSONField(null=True, blank=True)
+
+    languages = models.ManyToManyField(Language, through="DocumentLanguage",
+                                       related_name="documents")
+
+    class Meta:
+        managed  = False
+        db_table = "documents"
+        indexes  = [
+            models.Index(fields=["trade_show"]),
+            models.Index(fields=["document_type"]),
+            models.Index(fields=["trade_show", "document_type"]),
+            models.Index(fields=["file_hash"]),
+            models.Index(fields=["ingestion_status"]),
+            models.Index(fields=["ingested_at"]),
+        ]
+
+    def __str__(self):
+        return self.file_name or str(self.id)
+
+
+class DocumentLanguage(models.Model):
+    document = models.ForeignKey(Document, on_delete=models.CASCADE)
+    language = models.ForeignKey(Language, on_delete=models.CASCADE)
+
+    class Meta:
+        managed  = False
+        db_table = "document_languages"
+        unique_together = [("document", "language")]
+
+
+# ════════════════════════════════════════════════════════════
+# JUNCTION / THROUGH TABLES
+# ════════════════════════════════════════════════════════════
+
+class TradeShowSector(models.Model):
+    trade_show = models.ForeignKey(TradeShow, on_delete=models.CASCADE)
+    sector     = models.ForeignKey(Sector,    on_delete=models.CASCADE)
+
+    class Meta:
+        managed  = False
+        db_table = "trade_show_sectors"
+        unique_together = [("trade_show", "sector")]
+
+
+class CompanySector(models.Model):
+    company = models.ForeignKey(Company, on_delete=models.CASCADE)
+    sector  = models.ForeignKey(Sector,  on_delete=models.CASCADE)
+
+    class Meta:
+        managed  = False
+        db_table = "company_sectors"
+        unique_together = [("company", "sector")]
+
+
+class CompanyDoc(models.Model):
+    document = models.ForeignKey(Document, on_delete=models.CASCADE)
+    company  = models.ForeignKey(Company,  on_delete=models.CASCADE)
+
+    class Meta:
+        managed  = False
+        db_table = "company_docs"
+        unique_together = [("document", "company")]
+
+
+class CompanyPhone(models.Model):
+    company = models.ForeignKey(Company, on_delete=models.CASCADE)
+    phone   = models.ForeignKey(Phone,   on_delete=models.CASCADE)
+
+    class Meta:
+        managed  = False
+        db_table = "company_phones"
+        unique_together = [("company", "phone")]
+
+
+class CompanyContactPhone(models.Model):
+    company_contact = models.ForeignKey(CompanyContact, on_delete=models.CASCADE)
+    phone           = models.ForeignKey(Phone,          on_delete=models.CASCADE)
+
+    class Meta:
+        managed  = False
+        db_table = "company_contact_phones"
+        unique_together = [("company_contact", "phone")]
+
+
+class CompanyEmail(models.Model):
+    company = models.ForeignKey(Company, on_delete=models.CASCADE)
+    email   = models.ForeignKey(Email,   on_delete=models.CASCADE)
+
+    class Meta:
+        managed  = False
+        db_table = "company_emails"
+        unique_together = [("company", "email")]
+
+
+class CompanyContactEmail(models.Model):
+    company_contact = models.ForeignKey(CompanyContact, on_delete=models.CASCADE)
+    email           = models.ForeignKey(Email,          on_delete=models.CASCADE)
+
+    class Meta:
+        managed  = False
+        db_table = "company_contact_emails"
+        unique_together = [("company_contact", "email")]
+
+
+class CompanyWebsite(models.Model):
+    company = models.ForeignKey(Company, on_delete=models.CASCADE)
+    website = models.ForeignKey(Website, on_delete=models.CASCADE)
+
+    class Meta:
+        managed  = False
+        db_table = "company_websites"
+        unique_together = [("company", "website")]
+
+
+class CompanySocialNetwork(models.Model):
+    company                = models.ForeignKey(Company,              on_delete=models.CASCADE)
+    social_network_account = models.ForeignKey(SocialNetworkAccount, on_delete=models.CASCADE)
+
+    class Meta:
+        managed  = False
+        db_table = "company_social_networks"
+        unique_together = [("company", "social_network_account")]
+
+
+class CompanyContactSocialNetwork(models.Model):
+    company_contact        = models.ForeignKey(CompanyContact,       on_delete=models.CASCADE)
+    social_network_account = models.ForeignKey(SocialNetworkAccount, on_delete=models.CASCADE)
+
+    class Meta:
+        managed  = False
+        db_table = "company_contact_social_networks"
+        unique_together = [("company_contact", "social_network_account")]
+
+
+# ════════════════════════════════════════════════════════════
+# PROVENANCE / ORIGIN TABLES
+# ════════════════════════════════════════════════════════════
+
+class OriginDocBase(models.Model):
+    """Abstract base for all *_origin_docs tables."""
+    document           = models.ForeignKey(Document, on_delete=models.CASCADE)
+    page_number        = models.IntegerField(null=True, blank=True)
+    raw_text           = models.TextField(null=True, blank=True)
+    confidence_score   = models.DecimalField(max_digits=4, decimal_places=3,
+                                             null=True, blank=True)
+    extraction_engine  = models.CharField(max_length=100, null=True, blank=True)
+    extracted_at       = models.DateTimeField(null=True, blank=True)
+    metadata           = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        abstract = True
+
+
+class PhoneOriginDoc(OriginDocBase):
+    phone = models.ForeignKey(Phone, on_delete=models.CASCADE, related_name="origin_docs")
+
+    class Meta:
+        managed  = False
+        db_table = "phone_origin_docs"
+        unique_together = [("document", "phone")]
+
+
+class AddressOriginDoc(OriginDocBase):
+    company_address = models.ForeignKey(CompanyAddress, on_delete=models.CASCADE,
+                                        related_name="origin_docs")
+
+    class Meta:
+        managed  = False
+        db_table = "address_origin_docs"
+        unique_together = [("document", "company_address")]
+
+
+class WebsiteOriginDoc(OriginDocBase):
+    website = models.ForeignKey(Website, on_delete=models.CASCADE, related_name="origin_docs")
+
+    class Meta:
+        managed  = False
+        db_table = "website_origin_docs"
+        unique_together = [("document", "website")]
+
+
+class EmailOriginDoc(OriginDocBase):
+    email = models.ForeignKey(Email, on_delete=models.CASCADE, related_name="origin_docs")
+
+    class Meta:
+        managed  = False
+        db_table = "email_origin_docs"
+        unique_together = [("document", "email")]
+
+
+class ContactOriginDoc(OriginDocBase):
+    company_contact = models.ForeignKey(CompanyContact, on_delete=models.CASCADE,
+                                        related_name="origin_docs")
+
+    class Meta:
+        managed  = False
+        db_table = "contact_origin_docs"
+        unique_together = [("document", "company_contact")]
+
+
+class SocialNetworkOriginDoc(OriginDocBase):
+    social_network_account = models.ForeignKey(SocialNetworkAccount, on_delete=models.CASCADE,
+                                               related_name="origin_docs")
+
+    class Meta:
+        managed  = False
+        db_table = "social_network_origin_docs"
+        unique_together = [("document", "social_network_account")]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 3 — SERVICES & QUERIES  (apps/safex/services/) (done)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+────────────────────────────────────────────────────────────
+FILE: apps/safex/services/company.py
+────────────────────────────────────────────────────────────
+
+from django.core.cache import cache
+from django.db.models import Count, Prefetch, Q
+from apps.safex.models import (
+    Company, Phone, Email, Website,
+    CompanyContact, CompanyAddress, SocialNetworkAccount,
+    CompanyProfileCache,
+)
+
+
+class CompanyService:
+
+    # ── 1. List companies filtered by trade show ──────────────
+    @staticmethod
+    def get_companies_by_trade_show(trade_show_id: int):
+        """
+        Returns all companies that appeared in documents
+        belonging to the given trade show.
+        """
+        return (
+            Company.objects
+            .filter(documents__trade_show_id=trade_show_id)
+            .distinct()
+            .order_by("legal_name")
+        )
+
+    # ── 2. List companies filtered by year ────────────────────
+    @staticmethod
+    def get_companies_by_year(year: int):
+        return (
+            Company.objects
+            .filter(documents__trade_show__exhibition_year=year)
+            .distinct()
+            .order_by("legal_name")
+        )
+
+    # ── 3. Filter by trade show AND year ─────────────────────
+    @staticmethod
+    def get_companies_by_show_and_year(trade_show_name: str, year: int):
+        return (
+            Company.objects
+            .filter(
+                documents__trade_show__name=trade_show_name,
+                documents__trade_show__exhibition_year=year,
+            )
+            .distinct()
+            .order_by("legal_name")
+        )
+
+    # ── 4. Filter by sector ───────────────────────────────────
+    @staticmethod
+    def get_companies_by_sector(sector_id: int):
+        return (
+            Company.objects
+            .filter(sectors__id=sector_id)
+            .distinct()
+            .order_by("legal_name")
+        )
+
+    # ── 5. Filter by country ──────────────────────────────────
+    @staticmethod
+    def get_companies_by_country(country: str):
+        return (
+            Company.objects
+            .filter(addresses__country__iexact=country)
+            .distinct()
+            .order_by("legal_name")
+        )
+
+    # ── 6. Combined filter (trade_show + year + sector + country)
+    @staticmethod
+    def get_companies_filtered(
+        trade_show_id=None,
+        year=None,
+        sector_id=None,
+        country=None,
+        search=None,
+    ):
+        qs = Company.objects.all()
+
+        if trade_show_id:
+            qs = qs.filter(documents__trade_show_id=trade_show_id)
+        if year:
+            qs = qs.filter(documents__trade_show__exhibition_year=year)
+        if sector_id:
+            qs = qs.filter(sectors__id=sector_id)
+        if country:
+            qs = qs.filter(addresses__country__iexact=country)
+        if search:
+            qs = qs.filter(
+                Q(legal_name__icontains=search) |
+                Q(normalized_legal_name__icontains=search)
+            )
+
+        return qs.distinct().order_by("legal_name")
+
+    # ── 7. Get all phone numbers for a company ────────────────
+    @staticmethod
+    def get_company_phones(company_id: int):
+        """
+        Returns company-level phones + all contact-level phones,
+        annotated with phone type label.
+        """
+        company_phones = (
+            Phone.objects
+            .filter(companies__id=company_id)
+            .select_related("phone_type")
+            .values(
+                "id",
+                "full_phone_number",
+                "phone_number",
+                "country_dial_code",
+                "phone_type__label",
+            )
+        )
+        contact_phones = (
+            Phone.objects
+            .filter(contact_owners__company_id=company_id)
+            .select_related("phone_type")
+            .values(
+                "id",
+                "full_phone_number",
+                "phone_number",
+                "country_dial_code",
+                "phone_type__label",
+                "contact_owners__first_name",
+                "contact_owners__last_name",
+                "contact_owners__role",
+            )
+        )
+        return {"company_phones": list(company_phones),
+                "contact_phones": list(contact_phones)}
+
+    # ── 8. Get all emails for a company ───────────────────────
+    @staticmethod
+    def get_company_emails(company_id: int):
+        company_emails = (
+            Email.objects
+            .filter(companies__id=company_id)
+            .values("id", "email_address", "is_professional")
+        )
+        contact_emails = (
+            Email.objects
+            .filter(contact_owners__company_id=company_id)
+            .values(
+                "id",
+                "email_address",
+                "is_professional",
+                "contact_owners__first_name",
+                "contact_owners__last_name",
+                "contact_owners__role",
+            )
+        )
+        return {"company_emails": list(company_emails),
+                "contact_emails": list(contact_emails)}
+
+    # ── 9. Full company profile (single DB query batch) ───────
+    @staticmethod
+    def get_company_full_profile(company_id: int):
+        """
+        Returns the complete profile of one company:
+        addresses, contacts, phones, emails, websites,
+        social networks, sectors, trade shows appeared in.
+        Uses select_related + prefetch_related to avoid N+1.
+        """
+        cache_key = f"company:full_profile:{company_id}"
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+
+        try:
+            company = (
+                Company.objects
+                .prefetch_related(
+                    "addresses",
+                    Prefetch("phones", queryset=Phone.objects.select_related("phone_type")),
+                    Prefetch("emails"),
+                    Prefetch("websites"),
+                    Prefetch(
+                        "social_networks",
+                        queryset=SocialNetworkAccount.objects.select_related("social_network_type"),
+                    ),
+                    Prefetch(
+                        "contacts",
+                        queryset=CompanyContact.objects.prefetch_related(
+                            Prefetch("phones",
+                                     queryset=Phone.objects.select_related("phone_type")),
+                            "emails",
+                        ),
+                    ),
+                    "sectors",
+                    "documents__trade_show",
+                )
+                .get(id=company_id)
+            )
+        except Company.DoesNotExist:
+            return None
+
+        profile = _serialize_company_profile(company)
+        cache.set(cache_key, profile, timeout=600)   # 10 min cache
+        return profile
+
+    # ── 10. Count companies per trade show (dashboard KPI) ───
+    @staticmethod
+    def get_company_count_per_trade_show():
+        cache_key = "kpi:companies_per_trade_show"
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+
+        result = (
+            Company.objects
+            .values("documents__trade_show__name",
+                    "documents__trade_show__exhibition_year")
+            .annotate(company_count=Count("id", distinct=True))
+            .order_by("-documents__trade_show__exhibition_year")
+        )
+        data = list(result)
+        cache.set(cache_key, data, timeout=300)
+        return data
+
+
+def _serialize_company_profile(company: Company) -> dict:
+    """Internal helper — converts ORM objects to plain dict for caching."""
+    return {
+        "id":         company.id,
+        "legal_name": company.legal_name,
+        "logo":       company.logo,
+        "sectors":    [s.title for s in company.sectors.all()],
+        "addresses":  [
+            {"street": a.street, "city": a.city, "country": a.country,
+             "postal_code": a.postal_code}
+            for a in company.addresses.all()
+        ],
+        "phones":     [
+            {"number": p.full_phone_number, "type": p.phone_type.label}
+            for p in company.phones.all()
+        ],
+        "emails":     [
+            {"address": e.email_address, "professional": e.is_professional}
+            for e in company.emails.all()
+        ],
+        "websites":   [{"url": w.url, "type": w.website_type} for w in company.websites.all()],
+        "social_networks": [
+            {"platform": sn.social_network_type.code, "value": sn.account_value,
+             "url": sn.profile_url}
+            for sn in company.social_networks.all()
+        ],
+        "contacts":   [
+            {
+                "name":   f"{c.first_name} {c.last_name or ''}".strip(),
+                "role":   c.role,
+                "phones": [p.full_phone_number for p in c.phones.all()],
+                "emails": [e.email_address for e in c.emails.all()],
+            }
+            for c in company.contacts.all()
+        ],
+        "trade_shows": list({
+            f"{d.trade_show.name} ({d.trade_show.exhibition_year})"
+            for d in company.documents.all()
+        }),
+    }
+
+
+────────────────────────────────────────────────────────────
+FILE: apps/safex/services/trade_show.py
+────────────────────────────────────────────────────────────
+
+from django.db.models import Count
+from django.core.cache import cache
+from apps.safex.models import TradeShow, Document
+
+
+class TradeShowService:
+
+    @staticmethod
+    def get_all_trade_shows():
+        return TradeShow.objects.all().order_by("-exhibition_year", "name")
+
+    @staticmethod
+    def get_trade_show_stats(trade_show_id: int) -> dict:
+        """KPI block for one trade show edition."""
+        cache_key = f"trade_show:stats:{trade_show_id}"
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+
+        ts = TradeShow.objects.get(id=trade_show_id)
+        docs = Document.objects.filter(trade_show_id=trade_show_id)
+
+        stats = {
+            "id":            ts.id,
+            "name":          ts.name,
+            "year":          ts.exhibition_year,
+            "city":          ts.city,
+            "country":       ts.country,
+            "document_count": docs.count(),
+            "company_count":  (
+                ts.companies.values("id").distinct().count()
+                if hasattr(ts, "companies") else
+                docs.aggregate(c=Count("companies__id", distinct=True))["c"] or 0
+            ),
+            "docs_by_type":  list(
+                docs.values("document_type__label")
+                    .annotate(count=Count("id"))
+            ),
+            "ingestion_status": list(
+                docs.values("ingestion_status")
+                    .annotate(count=Count("id"))
+            ),
+        }
+        cache.set(cache_key, stats, timeout=300)
+        return stats
+
+
+────────────────────────────────────────────────────────────
+FILE: apps/safex/services/analytics.py
+────────────────────────────────────────────────────────────
+
+from django.db.models import Count, Q
+from django.core.cache import cache
+from apps.safex.models import Company, Document, TradeShow, Email, Phone
+
+
+class AnalyticsService:
+
+    @staticmethod
+    def get_dashboard_kpis() -> dict:
+        cache_key = "dashboard:global_kpis"
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+
+        data = {
+            "total_companies":   Company.objects.count(),
+            "total_trade_shows": TradeShow.objects.count(),
+            "total_documents":   Document.objects.count(),
+            "total_emails":      Email.objects.count(),
+            "total_phones":      Phone.objects.count(),
+            "companies_by_year": list(
+                Company.objects
+                .values("documents__trade_show__exhibition_year")
+                .annotate(count=Count("id", distinct=True))
+                .order_by("documents__trade_show__exhibition_year")
+            ),
+            "docs_by_status": list(
+                Document.objects
+                .values("ingestion_status")
+                .annotate(count=Count("id"))
+            ),
+            "companies_by_country": list(
+                Company.objects
+                .values("addresses__country")
+                .annotate(count=Count("id", distinct=True))
+                .order_by("-count")[:10]
+            ),
+            "companies_by_sector": list(
+                Company.objects
+                .values("sectors__title")
+                .annotate(count=Count("id", distinct=True))
+                .order_by("-count")
+            ),
+        }
+        cache.set(cache_key, data, timeout=300)
+        return data
+
+    @staticmethod
+    def get_document_ingestion_progress(trade_show_id: int) -> dict:
+        docs = Document.objects.filter(trade_show_id=trade_show_id)
+        total = docs.count()
+        ingested = docs.filter(ingestion_status="done").count()
+        return {
+            "total":    total,
+            "ingested": ingested,
+            "pending":  total - ingested,
+            "pct":      round(ingested / total * 100, 1) if total else 0,
+        }
+
+
+────────────────────────────────────────────────────────────
+FILE: apps/safex/services/search.py
+────────────────────────────────────────────────────────────
+
+from django.db.models import Q
+from apps.safex.models import Company, CompanyContact, Email, Phone
+
+
+class SearchService:
+
+    @staticmethod
+    def global_search(query: str, limit: int = 20):
+        """
+        Searches companies by name, contacts by name,
+        emails and phone numbers simultaneously.
+        Returns a unified result dict.
+        """
+        companies = (
+            Company.objects
+            .filter(
+                Q(legal_name__icontains=query) |
+                Q(normalized_legal_name__icontains=query)
+            )
+            .values("id", "legal_name", "logo")[:limit]
+        )
+        contacts = (
+            CompanyContact.objects
+            .filter(
+                Q(first_name__icontains=query) |
+                Q(last_name__icontains=query)
+            )
+            .select_related("company")
+            .values("id", "first_name", "last_name", "role",
+                    "company__id", "company__legal_name")[:limit]
+        )
+        emails = (
+            Email.objects
+            .filter(email_address__icontains=query)
+            .values("id", "email_address", "is_professional")[:limit]
+        )
+        phones = (
+            Phone.objects
+            .filter(
+                Q(full_phone_number__icontains=query) |
+                Q(phone_number__icontains=query)
+            )
+            .select_related("phone_type")
+            .values("id", "full_phone_number", "phone_type__label")[:limit]
+        )
+        return {
+            "companies": list(companies),
+            "contacts":  list(contacts),
+            "emails":    list(emails),
+            "phones":    list(phones),
+        }
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 4 — SERIALIZERS  (apps/safex/api/serializers.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+from rest_framework import serializers
+from apps.safex.models import (
+    TradeShow, Sector, Company, CompanyContact,
+    CompanyAddress, Phone, Email, Website,
+    SocialNetworkAccount, Document, CompanyDescription,
+)
+
+
+class SectorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model  = Sector
+        fields = ["id", "title"]
+
+
+class TradeShowSerializer(serializers.ModelSerializer):
+    class Meta:
+        model  = TradeShow
+        fields = ["id", "name", "exhibition_year", "venue_name", "city", "country"]
+
+
+class PhoneSerializer(serializers.ModelSerializer):
+    type = serializers.CharField(source="phone_type.label", read_only=True)
+
+    class Meta:
+        model  = Phone
+        fields = ["id", "full_phone_number", "phone_number",
+                  "country_dial_code", "type"]
+
+
+class EmailSerializer(serializers.ModelSerializer):
+    class Meta:
+        model  = Email
+        fields = ["id", "email_address", "is_professional"]
+
+
+class WebsiteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model  = Website
+        fields = ["id", "url", "website_type", "description"]
+
+
+class SocialNetworkAccountSerializer(serializers.ModelSerializer):
+    platform = serializers.CharField(source="social_network_type.code", read_only=True)
+
+    class Meta:
+        model  = SocialNetworkAccount
+        fields = ["id", "platform", "account_value", "profile_url"]
+
+
+class CompanyAddressSerializer(serializers.ModelSerializer):
+    class Meta:
+        model  = CompanyAddress
+        fields = ["id", "street", "postal_code", "city", "country"]
+
+
+class CompanyContactSerializer(serializers.ModelSerializer):
+    phones = PhoneSerializer(many=True, read_only=True)
+    emails = EmailSerializer(many=True, read_only=True)
+
+    class Meta:
+        model  = CompanyContact
+        fields = ["id", "first_name", "last_name", "role", "phones", "emails"]
+
+
+class CompanyListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for list views."""
+    sectors      = SectorSerializer(many=True, read_only=True)
+    country      = serializers.SerializerMethodField()
+
+    class Meta:
+        model  = Company
+        fields = ["id", "legal_name", "logo", "sectors", "country"]
+
+    def get_country(self, obj):
+        addr = obj.addresses.first()
+        return addr.country if addr else None
+
+
+class CompanyDetailSerializer(serializers.ModelSerializer):
+    """Full serializer for detail/profile view."""
+    sectors         = SectorSerializer(many=True, read_only=True)
+    addresses       = CompanyAddressSerializer(many=True, read_only=True)
+    phones          = PhoneSerializer(many=True, read_only=True)
+    emails          = EmailSerializer(many=True, read_only=True)
+    websites        = WebsiteSerializer(many=True, read_only=True)
+    social_networks = SocialNetworkAccountSerializer(many=True, read_only=True)
+    contacts        = CompanyContactSerializer(many=True, read_only=True)
+    trade_shows     = serializers.SerializerMethodField()
+
+    class Meta:
+        model  = Company
+        fields = [
+            "id", "legal_name", "logo",
+            "sectors", "addresses", "phones", "emails",
+            "websites", "social_networks", "contacts", "trade_shows",
+        ]
+
+    def get_trade_shows(self, obj):
+        return list({
+            f"{d.trade_show.name} ({d.trade_show.exhibition_year})"
+            for d in obj.documents.select_related("trade_show").all()
+        })
+
+
+class DocumentSerializer(serializers.ModelSerializer):
+    trade_show    = TradeShowSerializer(read_only=True)
+    document_type = serializers.CharField(source="document_type.label")
+
+    class Meta:
+        model  = Document
+        fields = ["id", "trade_show", "document_type", "file_name",
+                  "page_count", "ingestion_status", "ingested_at"]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 5 — FILTERSETS  (apps/safex/api/filters.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+import django_filters
+from apps.safex.models import Company, Document
+
+
+class CompanyFilter(django_filters.FilterSet):
+    trade_show_id  = django_filters.NumberFilter(
+        field_name="documents__trade_show__id"
+    )
+    year           = django_filters.NumberFilter(
+        field_name="documents__trade_show__exhibition_year"
+    )
+    trade_show_name = django_filters.CharFilter(
+        field_name="documents__trade_show__name", lookup_expr="icontains"
+    )
+    sector_id      = django_filters.NumberFilter(field_name="sectors__id")
+    sector_title   = django_filters.CharFilter(
+        field_name="sectors__title", lookup_expr="icontains"
+    )
+    country        = django_filters.CharFilter(
+        field_name="addresses__country", lookup_expr="iexact"
+    )
+    city           = django_filters.CharFilter(
+        field_name="addresses__city", lookup_expr="icontains"
+    )
+    name           = django_filters.CharFilter(
+        field_name="legal_name", lookup_expr="icontains"
+    )
+
+    class Meta:
+        model  = Company
+        fields = ["trade_show_id", "year", "sector_id", "country", "city", "name"]
+
+
+class DocumentFilter(django_filters.FilterSet):
+    trade_show_id  = django_filters.NumberFilter(field_name="trade_show__id")
+    year           = django_filters.NumberFilter(
+        field_name="trade_show__exhibition_year"
+    )
+    status         = django_filters.CharFilter(field_name="ingestion_status")
+    doc_type       = django_filters.CharFilter(field_name="document_type__code")
+
+    class Meta:
+        model  = Document
+        fields = ["trade_show_id", "year", "status", "doc_type"]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 6 — API VIEWS  (apps/safex/api/views.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+from rest_framework import generics, views
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework.filters import SearchFilter, OrderingFilter
+
+from apps.safex.models import TradeShow, Company, Document, Sector
+from apps.safex.api.serializers import (
+    TradeShowSerializer, CompanyListSerializer, CompanyDetailSerializer,
+    DocumentSerializer, SectorSerializer,
+)
+from apps.safex.api.filters import CompanyFilter, DocumentFilter
+from apps.safex.services.company import CompanyService
+from apps.safex.services.trade_show import TradeShowService
+from apps.safex.services.analytics import AnalyticsService
+from apps.safex.services.search import SearchService
+
+
+# ── Trade Shows ───────────────────────────────────────────────
+
+class TradeShowListView(generics.ListAPIView):
+    queryset           = TradeShow.objects.all().order_by("-exhibition_year", "name")
+    serializer_class   = TradeShowSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends    = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_fields   = ["exhibition_year", "country", "city"]
+    search_fields      = ["name", "city", "country"]
+    ordering_fields    = ["exhibition_year", "name"]
+
+
+class TradeShowDetailView(generics.RetrieveAPIView):
+    queryset           = TradeShow.objects.all()
+    serializer_class   = TradeShowSerializer
+    permission_classes = [IsAuthenticated]
+
+
+class TradeShowStatsView(views.APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        stats = TradeShowService.get_trade_show_stats(pk)
+        return Response(stats)
+
+
+# ── Sectors ───────────────────────────────────────────────────
+
+class SectorListView(generics.ListAPIView):
+    queryset           = Sector.objects.all()
+    serializer_class   = SectorSerializer
+    permission_classes = [IsAuthenticated]
+
+
+# ── Companies ─────────────────────────────────────────────────
+
+class CompanyListView(generics.ListAPIView):
+    serializer_class   = CompanyListSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends    = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_class    = CompanyFilter
+    search_fields      = ["legal_name", "normalized_legal_name"]
+    ordering_fields    = ["legal_name"]
+    ordering           = ["legal_name"]
+
+    def get_queryset(self):
+        return (
+            Company.objects
+            .prefetch_related("sectors", "addresses")
+            .distinct()
+        )
+
+
+class CompanyDetailView(generics.RetrieveAPIView):
+    serializer_class   = CompanyDetailSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return (
+            Company.objects
+            .prefetch_related(
+                "sectors", "addresses", "phones__phone_type",
+                "emails", "websites", "social_networks__social_network_type",
+                "contacts__phones__phone_type", "contacts__emails",
+                "documents__trade_show",
+            )
+        )
+
+
+class CompanyProfileCacheView(views.APIView):
+    """Returns pre-computed profile from cache (fastest endpoint)."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        profile = CompanyService.get_company_full_profile(pk)
+        if not profile:
+            return Response({"detail": "Not found."}, status=404)
+        return Response(profile)
+
+
+class CompanyPhonesView(views.APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        data = CompanyService.get_company_phones(pk)
+        return Response(data)
+
+
+class CompanyEmailsView(views.APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        data = CompanyService.get_company_emails(pk)
+        return Response(data)
+
+
+class CompanyCountPerTradeShowView(views.APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        data = CompanyService.get_company_count_per_trade_show()
+        return Response(data)
+
+
+# ── Documents ─────────────────────────────────────────────────
+
+class DocumentListView(generics.ListAPIView):
+    serializer_class   = DocumentSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends    = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+    filterset_class    = DocumentFilter
+    search_fields      = ["file_name"]
+    ordering_fields    = ["ingested_at", "page_count"]
+
+    def get_queryset(self):
+        return Document.objects.select_related("trade_show", "document_type").all()
+
+
+class DocumentDetailView(generics.RetrieveAPIView):
+    queryset           = Document.objects.select_related("trade_show", "document_type")
+    serializer_class   = DocumentSerializer
+    permission_classes = [IsAuthenticated]
+
+
+class DocumentIngestionProgressView(views.APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        data = AnalyticsService.get_document_ingestion_progress(pk)
+        return Response(data)
+
+
+# ── Dashboard Analytics ───────────────────────────────────────
+
+class DashboardKPIView(views.APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        data = AnalyticsService.get_dashboard_kpis()
+        return Response(data)
+
+
+# ── Global Search ─────────────────────────────────────────────
+
+class GlobalSearchView(views.APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        query = request.query_params.get("q", "").strip()
+        if len(query) < 2:
+            return Response({"detail": "Query must be at least 2 characters."}, status=400)
+        results = SearchService.global_search(query)
+        return Response(results)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 7 — URL CONFIGURATION  (apps/safex/api/urls.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+from django.urls import path
+from apps.safex.api import views
+
+urlpatterns = [
+
+    # ── Trade Shows ─────────────────────────────────────────
+    # GET  /api/v1/trade-shows/
+    # GET  /api/v1/trade-shows/?exhibition_year=2024&country=Algeria
+    path("trade-shows/",
+         views.TradeShowListView.as_view(),
+         name="trade-show-list"),
+
+    # GET  /api/v1/trade-shows/3/
+    path("trade-shows/<int:pk>/",
+         views.TradeShowDetailView.as_view(),
+         name="trade-show-detail"),
+
+    # GET  /api/v1/trade-shows/3/stats/
+    # Returns: company_count, document_count, docs_by_type, ingestion_status
+    path("trade-shows/<int:pk>/stats/",
+         views.TradeShowStatsView.as_view(),
+         name="trade-show-stats"),
+
+    # GET  /api/v1/trade-shows/3/ingestion-progress/
+    path("trade-shows/<int:pk>/ingestion-progress/",
+         views.DocumentIngestionProgressView.as_view(),
+         name="trade-show-ingestion-progress"),
+
+    # ── Sectors ─────────────────────────────────────────────
+    # GET  /api/v1/sectors/
+    path("sectors/",
+         views.SectorListView.as_view(),
+         name="sector-list"),
+
+    # ── Companies ───────────────────────────────────────────
+    # GET  /api/v1/companies/
+    # GET  /api/v1/companies/?trade_show_id=3
+    # GET  /api/v1/companies/?year=2024
+    # GET  /api/v1/companies/?trade_show_id=3&year=2024&sector_id=1
+    # GET  /api/v1/companies/?country=Algeria
+    # GET  /api/v1/companies/?country=Algeria&city=Alger
+    # GET  /api/v1/companies/?search=Temacina
+    # GET  /api/v1/companies/?ordering=-legal_name
+    path("companies/",
+         views.CompanyListView.as_view(),
+         name="company-list"),
+
+    # GET  /api/v1/companies/42/
+    # Full detail: addresses, phones, emails, websites, contacts, social networks
+    path("companies/<int:pk>/",
+         views.CompanyDetailView.as_view(),
+         name="company-detail"),
+
+    # GET  /api/v1/companies/42/profile/
+    # Fastest endpoint — returns pre-computed cached profile JSON
+    path("companies/<int:pk>/profile/",
+         views.CompanyProfileCacheView.as_view(),
+         name="company-profile"),
+
+    # GET  /api/v1/companies/42/phones/
+    # Returns company-level AND contact-level phone numbers separately
+    path("companies/<int:pk>/phones/",
+         views.CompanyPhonesView.as_view(),
+         name="company-phones"),
+
+    # GET  /api/v1/companies/42/emails/
+    # Returns company-level AND contact-level emails separately
+    path("companies/<int:pk>/emails/",
+         views.CompanyEmailsView.as_view(),
+         name="company-emails"),
+
+    # GET  /api/v1/companies/count-per-trade-show/
+    # Dashboard KPI: how many companies per show/year
+    path("companies/count-per-trade-show/",
+         views.CompanyCountPerTradeShowView.as_view(),
+         name="company-count-per-trade-show"),
+
+    # ── Documents ───────────────────────────────────────────
+    # GET  /api/v1/documents/
+    # GET  /api/v1/documents/?trade_show_id=3
+    # GET  /api/v1/documents/?year=2024
+    # GET  /api/v1/documents/?status=done
+    # GET  /api/v1/documents/?doc_type=CATALOGUE
+    path("documents/",
+         views.DocumentListView.as_view(),
+         name="document-list"),
+
+    # GET  /api/v1/documents/7/
+    path("documents/<int:pk>/",
+         views.DocumentDetailView.as_view(),
+         name="document-detail"),
+
+    # ── Dashboard KPIs ──────────────────────────────────────
+    # GET  /api/v1/dashboard/kpis/
+    # Returns global counts + breakdowns by year, country, sector, ingestion status
+    path("dashboard/kpis/",
+         views.DashboardKPIView.as_view(),
+         name="dashboard-kpis"),
+
+    # ── Global Search ────────────────────────────────────────
+    # GET  /api/v1/search/?q=Temacina
+    # Searches: company names, contact names, emails, phone numbers
+    path("search/",
+         views.GlobalSearchView.as_view(),
+         name="global-search"),
+]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 8 — REGISTER SAFEX URLS IN ROOT config/urls.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Add this line to config/urls.py alongside the existing routes:
+
+    path("api/v1/", include("apps.safex.api.urls")),
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 9 — FULL ENDPOINT REFERENCE TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+METHOD  ENDPOINT                                    AUTH   DESCRIPTION
+──────────────────────────────────────────────────────────────────────────
+
+# ── Authentication (existing) ──────────────────────────────────────────
+POST    /api/v1/auth/login/                         No     Get JWT tokens
+POST    /api/v1/auth/refresh/                       No     Refresh access token
+POST    /api/v1/auth/logout/                        Yes    Blacklist refresh token
+POST    /api/v1/auth/password/change/               Yes    Change password
+
+# ── Reference Data ─────────────────────────────────────────────────────
+GET     /api/v1/trade-shows/                        Yes    List all trade shows
+GET     /api/v1/trade-shows/?exhibition_year=2024   Yes    Filter by year
+GET     /api/v1/trade-shows/{id}/                   Yes    Trade show detail
+GET     /api/v1/trade-shows/{id}/stats/             Yes    KPI block for one show
+GET     /api/v1/trade-shows/{id}/ingestion-progress/Yes    OCR ingestion progress %
+GET     /api/v1/sectors/                            Yes    List all sectors
+
+# ── Companies ──────────────────────────────────────────────────────────
+GET     /api/v1/companies/                          Yes    List all companies (paginated)
+GET     /api/v1/companies/?trade_show_id={id}       Yes    Companies of one trade show
+GET     /api/v1/companies/?year={year}              Yes    Companies by exhibition year
+GET     /api/v1/companies/?sector_id={id}           Yes    Companies by sector
+GET     /api/v1/companies/?country={country}        Yes    Companies by country
+GET     /api/v1/companies/?city={city}              Yes    Companies by city
+GET     /api/v1/companies/?search={name}            Yes    Full-text search on name
+GET     /api/v1/companies/?trade_show_id=3&year=2024&sector_id=1&country=Algeria
+                                                    Yes    Combined multi-filter
+GET     /api/v1/companies/count-per-trade-show/     Yes    KPI: company count per show
+GET     /api/v1/companies/{id}/                     Yes    Full company detail
+GET     /api/v1/companies/{id}/profile/             Yes    Cached profile (fastest)
+GET     /api/v1/companies/{id}/phones/              Yes    All phones (co + contacts)
+GET     /api/v1/companies/{id}/emails/              Yes    All emails (co + contacts)
+
+# ── Documents ─────────────────────────────────────────────────────────
+GET     /api/v1/documents/                          Yes    List all documents
+GET     /api/v1/documents/?trade_show_id={id}       Yes    Docs of one trade show
+GET     /api/v1/documents/?year={year}              Yes    Docs by year
+GET     /api/v1/documents/?status=done              Yes    Filter by ingestion status
+GET     /api/v1/documents/?doc_type=CATALOGUE       Yes    Filter by document type
+GET     /api/v1/documents/{id}/                     Yes    Document detail
+
+# ── Dashboard ─────────────────────────────────────────────────────────
+GET     /api/v1/dashboard/kpis/                     Yes    Global KPI block
+                                                           (totals + breakdowns by
+                                                           year / country / sector)
+
+# ── Search ────────────────────────────────────────────────────────────
+GET     /api/v1/search/?q={query}                   Yes    Cross-entity search
+                                                           (companies + contacts
+                                                           + emails + phones)
+
+# ── Health & Users (existing) ─────────────────────────────────────────
+GET     /api/health/                                No     System health check
+GET     /api/v1/users/me/                           Yes    Current user profile
+GET     /api/v1/users/                              Admin  List all users
+GET     /api/v1/users/{id}/                         Admin  User detail
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 10 — IMPLEMENTATION ORDER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Follow this order exactly:
+
+  STEP 1   Create apps/safex/ with python manage.py startapp safex
+           Add "apps.safex" to LOCAL_APPS in base.py
+
+  STEP 2   Write models.py (all 32 models with managed=False)
+           Run: python manage.py migrate --fake-initial
+           Verify: python manage.py check
+
+  STEP 3   Write services/company.py → test each method in shell:
+           python manage.py shell
+           >>> from apps.safex.services.company import CompanyService
+           >>> CompanyService.get_companies_by_trade_show(1)
+
+  STEP 4   Write services/trade_show.py, analytics.py, search.py
+           Test each in the Django shell
+
+  STEP 5   Write api/serializers.py
+           Write api/filters.py
+           Write api/views.py
+           Write api/urls.py
+           Add to config/urls.py
+
+  STEP 6   Test all endpoints manually:
+           python manage.py runserver
+           GET http://localhost:8000/api/v1/trade-shows/
+           GET http://localhost:8000/api/v1/companies/?year=2024
+           GET http://localhost:8000/api/v1/dashboard/kpis/
+
+  STEP 7   Write admin.py to expose all models in Django Admin
+           (useful for data inspection without writing SQL)
+
+  STEP 8   Connect frontend:
+           Every fetch() call adds:
+           headers: { Authorization: "Bearer <access_token>" }
+           All responses arrive as: { success, data, meta, errors }
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 11 — FRONTEND INTEGRATION EXAMPLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const API = "https://api.temacina.com/api/v1"
+const token = () => localStorage.getItem("access_token")
+const headers = () => ({
+  "Content-Type": "application/json",
+  "Authorization": `Bearer ${token()}`
+})
+
+// Load dashboard KPIs on mount
+const kpis = await fetch(`${API}/dashboard/kpis/`, { headers: headers() })
+             .then(r => r.json()).then(r => r.data)
+
+// List companies for Safex 2024
+const companies = await fetch(
+  `${API}/companies/?trade_show_id=3&year=2024&page_size=50`,
+  { headers: headers() }
+).then(r => r.json())
+// companies.data = [...], companies.meta.total = 342
+
+// Get all phones + emails for company #42
+const phones = await fetch(`${API}/companies/42/phones/`, { headers: headers() })
+               .then(r => r.json()).then(r => r.data)
+
+const emails = await fetch(`${API}/companies/42/emails/`, { headers: headers() })
+               .then(r => r.json()).then(r => r.data)
+
+// Global search
+const results = await fetch(`${API}/search/?q=Temacina`, { headers: headers() })
+                .then(r => r.json()).then(r => r.data)
+// results.companies, results.contacts, results.emails, results.phones
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 12 — ADMIN REGISTRATION  (apps/safex/admin.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Registering models in Django Admin lets you inspect and
+verify live Neon data without writing SQL manually.
+Use this during development to confirm queries are correct.
+
+# ── apps/safex/admin.py ──────────────────────────────────────
+
+from django.contrib import admin
+from apps.safex.models import (
+    TradeShow, Sector, DocumentType, PhoneType, SocialNetworkType,
+    Company, CompanyContact, CompanyAddress, CompanyDescription,
+    Phone, Email, Website, SocialNetworkAccount,
+    Document, CompanyProfileCache,
+)
+
+
+@admin.register(TradeShow)
+class TradeShowAdmin(admin.ModelAdmin):
+    list_display  = ["name", "exhibition_year", "city", "country"]
+    list_filter   = ["exhibition_year", "country"]
+    search_fields = ["name", "city"]
+
+
+@admin.register(Company)
+class CompanyAdmin(admin.ModelAdmin):
+    list_display  = ["legal_name", "get_sectors", "get_country"]
+    search_fields = ["legal_name", "normalized_legal_name"]
+    list_filter   = ["sectors"]
+
+    def get_sectors(self, obj):
+        return ", ".join(s.title for s in obj.sectors.all())
+    get_sectors.short_description = "Sectors"
+
+    def get_country(self, obj):
+        addr = obj.addresses.first()
+        return addr.country if addr else "—"
+    get_country.short_description = "Country"
+
+
+@admin.register(CompanyContact)
+class CompanyContactAdmin(admin.ModelAdmin):
+    list_display  = ["first_name", "last_name", "role", "company"]
+    search_fields = ["first_name", "last_name", "role"]
+    list_filter   = ["role"]
+    raw_id_fields = ["company"]
+
+
+@admin.register(Phone)
+class PhoneAdmin(admin.ModelAdmin):
+    list_display  = ["full_phone_number", "phone_type", "country_dial_code"]
+    list_filter   = ["phone_type"]
+    search_fields = ["phone_number", "full_phone_number"]
+
+
+@admin.register(Email)
+class EmailAdmin(admin.ModelAdmin):
+    list_display  = ["email_address", "is_professional"]
+    list_filter   = ["is_professional"]
+    search_fields = ["email_address"]
+
+
+@admin.register(Document)
+class DocumentAdmin(admin.ModelAdmin):
+    list_display  = ["file_name", "trade_show", "document_type",
+                     "ingestion_status", "page_count", "ingested_at"]
+    list_filter   = ["ingestion_status", "document_type", "trade_show__exhibition_year"]
+    search_fields = ["file_name"]
+    date_hierarchy = "ingested_at"
+
+
+# Lightweight registrations for lookup tables
+admin.site.register(Sector)
+admin.site.register(DocumentType)
+admin.site.register(PhoneType)
+admin.site.register(SocialNetworkType)
+admin.site.register(Website)
+admin.site.register(SocialNetworkAccount)
+admin.site.register(CompanyAddress)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 13 — TEST SUITE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Test structure inside apps/safex/:
+
+    apps/safex/tests/
+    ├── __init__.py
+    ├── factories.py          ← factory-boy model factories
+    ├── test_models.py        ← model constraint tests
+    ├── test_services.py      ← service/query logic tests
+    └── test_api.py           ← endpoint integration tests
+
+IMPORTANT NOTE ON managed=False IN TESTS
+─────────────────────────────────────────
+Because all models have managed=False, pytest will not create
+their tables in the test SQLite database automatically.
+We handle this with a pytest fixture that creates them once
+before the test session using schema_editor.
+
+Add this to a root conftest.py file at the project root:
+
+
+# ── conftest.py  (project root) ──────────────────────────────
+
+import pytest
+from django.db import connection
+
+
+SAFEX_MODELS = [
+    "trade_shows", "sectors", "document_types", "phone_types",
+    "social_network_types", "languages", "companies",
+    "company_contacts", "company_addresses", "company_descriptions",
+    "phones", "emails", "websites", "social_network_accounts",
+    "documents", "document_languages", "trade_show_sectors",
+    "company_sectors", "company_docs", "company_phones",
+    "company_contact_phones", "company_emails", "company_contact_emails",
+    "company_websites", "company_social_networks",
+    "company_contact_social_networks", "company_profile_cache",
+    "phone_origin_docs", "address_origin_docs", "website_origin_docs",
+    "email_origin_docs", "contact_origin_docs", "social_network_origin_docs",
+]
+
+
+@pytest.fixture(scope="session")
+def django_db_setup(django_db_setup, django_db_blocker):
+    """
+    Create all managed=False tables in the test DB before any test runs.
+    Uses Django's schema editor so column types match the ORM exactly.
+    """
+    from django.apps import apps
+    with django_db_blocker.unblock():
+        with connection.schema_editor() as editor:
+            for model in apps.get_app_config("safex").get_models():
+                try:
+                    editor.create_model(model)
+                except Exception:
+                    pass   # table may already exist; ignore
+
+
+────────────────────────────────────────────────────────────
+FILE: apps/safex/tests/factories.py
+────────────────────────────────────────────────────────────
+
+import factory
+from factory.django import DjangoModelFactory
+from faker import Faker
+from apps.safex.models import (
+    TradeShow, Sector, DocumentType, PhoneType, SocialNetworkType,
+    Language, Company, CompanyContact, CompanyAddress,
+    Phone, Email, Website, SocialNetworkAccount,
+    Document, CompanyDoc, CompanyPhone, CompanyEmail,
+    CompanyWebsite, CompanySector,
+)
+
+fake = Faker()
+
+
+class TradeShowFactory(DjangoModelFactory):
+    class Meta:
+        model = TradeShow
+
+    name            = factory.Sequence(lambda n: f"Safex {n}")
+    exhibition_year = factory.Iterator([2022, 2023, 2024, 2025])
+    venue_name      = factory.LazyAttribute(lambda _: fake.company())
+    city            = factory.LazyAttribute(lambda _: fake.city())
+    country         = "Algeria"
+
+
+class SectorFactory(DjangoModelFactory):
+    class Meta:
+        model = Sector
+
+    title = factory.Sequence(lambda n: f"Sector_{n}")
+
+
+class DocumentTypeFactory(DjangoModelFactory):
+    class Meta:
+        model = DocumentType
+
+    code  = factory.Sequence(lambda n: f"TYPE_{n}")
+    label = factory.Sequence(lambda n: f"Type Label {n}")
+
+
+class PhoneTypeFactory(DjangoModelFactory):
+    class Meta:
+        model = PhoneType
+
+    code  = factory.Sequence(lambda n: f"PHONE_TYPE_{n}")
+    label = factory.Sequence(lambda n: f"Phone Type {n}")
+
+
+class SocialNetworkTypeFactory(DjangoModelFactory):
+    class Meta:
+        model = SocialNetworkType
+
+    code  = factory.Iterator(["LINKEDIN", "FACEBOOK", "INSTAGRAM", "X", "TIKTOK"])
+    label = factory.LazyAttribute(lambda o: o.code.capitalize())
+
+
+class LanguageFactory(DjangoModelFactory):
+    class Meta:
+        model = Language
+
+    language = factory.Iterator(["Arabic", "French", "English"])
+
+
+class CompanyFactory(DjangoModelFactory):
+    class Meta:
+        model = Company
+
+    legal_name            = factory.Sequence(lambda n: f"Company {n} SARL")
+    normalized_legal_name = factory.LazyAttribute(
+        lambda o: o.legal_name.lower().replace(" ", "_")
+    )
+    logo     = None
+    metadata = None
+
+
+class CompanyContactFactory(DjangoModelFactory):
+    class Meta:
+        model = CompanyContact
+
+    company    = factory.SubFactory(CompanyFactory)
+    first_name = factory.LazyAttribute(lambda _: fake.first_name())
+    last_name  = factory.LazyAttribute(lambda _: fake.last_name())
+    role       = factory.Iterator(["CEO", "Manager", "Sales", "Engineer"])
+
+
+class CompanyAddressFactory(DjangoModelFactory):
+    class Meta:
+        model = CompanyAddress
+
+    company     = factory.SubFactory(CompanyFactory)
+    street      = factory.LazyAttribute(lambda _: fake.street_address())
+    postal_code = factory.LazyAttribute(lambda _: fake.postcode())
+    city        = factory.LazyAttribute(lambda _: fake.city())
+    country     = "Algeria"
+
+
+class PhoneFactory(DjangoModelFactory):
+    class Meta:
+        model = Phone
+
+    phone_type        = factory.SubFactory(PhoneTypeFactory)
+    country_dial_code = "+213"
+    phone_number      = factory.Sequence(lambda n: f"055{n:07d}")
+    full_phone_number = factory.LazyAttribute(
+        lambda o: f"{o.country_dial_code}{o.phone_number}"
+    )
+    normalized_phone_number = factory.LazyAttribute(lambda o: o.full_phone_number)
+
+
+class EmailFactory(DjangoModelFactory):
+    class Meta:
+        model = Email
+
+    email_address            = factory.Sequence(lambda n: f"contact{n}@company{n}.dz")
+    normalized_email_address = factory.LazyAttribute(lambda o: o.email_address.lower())
+    is_professional          = True
+
+
+class WebsiteFactory(DjangoModelFactory):
+    class Meta:
+        model = Website
+
+    url            = factory.Sequence(lambda n: f"https://company{n}.dz")
+    normalized_url = factory.LazyAttribute(lambda o: o.url)
+    website_type   = "official"
+
+
+class SocialNetworkAccountFactory(DjangoModelFactory):
+    class Meta:
+        model = SocialNetworkAccount
+
+    social_network_type   = factory.SubFactory(SocialNetworkTypeFactory)
+    account_value         = factory.Sequence(lambda n: f"@company_{n}")
+    normalized_account_value = factory.LazyAttribute(lambda o: o.account_value.lower())
+    profile_url           = factory.Sequence(lambda n: f"https://linkedin.com/company/company_{n}")
+
+
+class DocumentFactory(DjangoModelFactory):
+    class Meta:
+        model = Document
+
+    trade_show       = factory.SubFactory(TradeShowFactory)
+    document_type    = factory.SubFactory(DocumentTypeFactory)
+    file_name        = factory.Sequence(lambda n: f"catalogue_{n}.pdf")
+    file_hash        = factory.Sequence(lambda n: f"abc{n:061d}")
+    page_count       = factory.LazyAttribute(lambda _: fake.random_int(1, 200))
+    ingestion_status = "done"
+
+
+# ── Convenience: build a fully-linked company ─────────────────
+def make_full_company(trade_show=None):
+    """
+    Creates a Company with address, phone, email, website,
+    contact, and links it to a trade show via a document.
+    Returns the Company instance.
+    """
+    ts       = trade_show or TradeShowFactory()
+    doc_type = DocumentTypeFactory()
+    doc      = DocumentFactory(trade_show=ts, document_type=doc_type)
+    company  = CompanyFactory()
+    sector   = SectorFactory()
+
+    CompanyAddressFactory(company=company)
+    CompanySector.objects.create(company=company, sector=sector)
+    CompanyDoc.objects.create(company=company, document=doc)
+
+    phone = PhoneFactory()
+    CompanyPhone.objects.create(company=company, phone=phone)
+
+    email = EmailFactory()
+    CompanyEmail.objects.create(company=company, email=email)
+
+    website = WebsiteFactory()
+    CompanyWebsite.objects.create(company=company, website=website)
+
+    CompanyContactFactory(company=company)
+
+    return company
+
+
+────────────────────────────────────────────────────────────
+FILE: apps/safex/tests/test_models.py
+────────────────────────────────────────────────────────────
+
+Verifies that model constraints and relationships work correctly
+against the test database tables created by conftest.py.
+
+import pytest
+from django.db import IntegrityError
+from apps.safex.tests.factories import (
+    TradeShowFactory, CompanyFactory, PhoneFactory,
+    EmailFactory, DocumentFactory, SectorFactory,
+    CompanySector, CompanyPhone, CompanyEmail, CompanyDoc,
+)
+
+
+@pytest.mark.django_db
+class TestTradeShowModel:
+
+    def test_create_trade_show(self):
+        ts = TradeShowFactory(name="Safex", exhibition_year=2024)
+        assert ts.id is not None
+        assert str(ts) == "Safex (2024)"
+
+    def test_unique_together_name_year(self):
+        TradeShowFactory(name="Safex", exhibition_year=2024)
+        with pytest.raises(IntegrityError):
+            TradeShowFactory(name="Safex", exhibition_year=2024)
+
+    def test_ordering_by_year_desc(self):
+        from apps.safex.models import TradeShow
+        TradeShowFactory(name="A", exhibition_year=2022)
+        TradeShowFactory(name="B", exhibition_year=2025)
+        shows = list(TradeShow.objects.all())
+        assert shows[0].exhibition_year >= shows[-1].exhibition_year
+
+
+@pytest.mark.django_db
+class TestCompanyModel:
+
+    def test_create_company(self):
+        c = CompanyFactory()
+        assert c.id is not None
+        assert c.legal_name != ""
+
+    def test_legal_name_unique(self):
+        CompanyFactory(legal_name="Temacina SARL")
+        with pytest.raises(IntegrityError):
+            CompanyFactory(legal_name="Temacina SARL")
+
+    def test_company_sector_relationship(self):
+        company = CompanyFactory()
+        sector  = SectorFactory()
+        CompanySector.objects.create(company=company, sector=sector)
+        assert company.sectors.count() == 1
+        assert company.sectors.first().title == sector.title
+
+    def test_company_phone_relationship(self):
+        company = CompanyFactory()
+        phone   = PhoneFactory()
+        CompanyPhone.objects.create(company=company, phone=phone)
+        assert company.phones.count() == 1
+        assert company.phones.first().full_phone_number == phone.full_phone_number
+
+    def test_company_email_relationship(self):
+        company = CompanyFactory()
+        email   = EmailFactory()
+        CompanyEmail.objects.create(company=company, email=email)
+        assert company.emails.count() == 1
+        assert company.emails.first().email_address == email.email_address
+
+    def test_company_document_relationship(self):
+        company = CompanyFactory()
+        doc     = DocumentFactory()
+        CompanyDoc.objects.create(company=company, document=doc)
+        assert company.documents.count() == 1
+
+
+@pytest.mark.django_db
+class TestEmailModel:
+
+    def test_email_unique(self):
+        EmailFactory(email_address="test@test.dz")
+        with pytest.raises(IntegrityError):
+            EmailFactory(email_address="test@test.dz")
+
+    def test_is_professional_flag(self):
+        pro    = EmailFactory(is_professional=True)
+        nonpro = EmailFactory(is_professional=False)
+        assert pro.is_professional is True
+        assert nonpro.is_professional is False
+
+
+@pytest.mark.django_db
+class TestPhoneModel:
+
+    def test_create_phone_with_type(self):
+        phone = PhoneFactory()
+        assert phone.phone_type is not None
+        assert phone.full_phone_number.startswith("+213")
+
+    def test_unique_phone_per_type(self):
+        from apps.safex.tests.factories import PhoneTypeFactory
+        pt = PhoneTypeFactory()
+        PhoneFactory(phone_type=pt, full_phone_number="+2130551234567")
+        with pytest.raises(IntegrityError):
+            PhoneFactory(phone_type=pt, full_phone_number="+2130551234567")
+
+
+────────────────────────────────────────────────────────────
+FILE: apps/safex/tests/test_services.py
+────────────────────────────────────────────────────────────
+
+Verifies that each service method returns the correct data.
+Uses make_full_company() to set up realistic relational data.
+
+import pytest
+from apps.safex.tests.factories import (
+    TradeShowFactory, CompanyFactory, SectorFactory,
+    CompanyDoc, DocumentFactory, CompanyPhone, PhoneFactory,
+    CompanyEmail, EmailFactory, CompanySector,
+    make_full_company,
+)
+from apps.safex.services.company   import CompanyService
+from apps.safex.services.trade_show import TradeShowService
+from apps.safex.services.analytics import AnalyticsService
+from apps.safex.services.search    import SearchService
+
+
+@pytest.mark.django_db
+class TestCompanyServiceFilters:
+
+    def test_get_companies_by_trade_show(self):
+        ts      = TradeShowFactory()
+        company = make_full_company(trade_show=ts)
+        # Company from a different trade show
+        make_full_company(trade_show=TradeShowFactory())
+
+        result = list(CompanyService.get_companies_by_trade_show(ts.id))
+        assert len(result) == 1
+        assert result[0].id == company.id
+
+    def test_get_companies_by_year(self):
+        ts2024 = TradeShowFactory(exhibition_year=2024)
+        ts2022 = TradeShowFactory(exhibition_year=2022)
+        c2024  = make_full_company(trade_show=ts2024)
+        make_full_company(trade_show=ts2022)
+
+        result = list(CompanyService.get_companies_by_year(2024))
+        ids    = [c.id for c in result]
+        assert c2024.id in ids
+        assert all(True for c in result)   # all returned belong to 2024
+
+    def test_get_companies_by_show_and_year(self):
+        ts = TradeShowFactory(name="Safex", exhibition_year=2024)
+        c  = make_full_company(trade_show=ts)
+        make_full_company(trade_show=TradeShowFactory(name="Other", exhibition_year=2024))
+
+        result = list(CompanyService.get_companies_by_show_and_year("Safex", 2024))
+        assert len(result) == 1
+        assert result[0].id == c.id
+
+    def test_get_companies_by_sector(self):
+        sector  = SectorFactory()
+        company = CompanyFactory()
+        CompanySector.objects.create(company=company, sector=sector)
+        other = CompanyFactory()   # no sector
+
+        result = list(CompanyService.get_companies_by_sector(sector.id))
+        ids    = [c.id for c in result]
+        assert company.id in ids
+        assert other.id not in ids
+
+    def test_get_companies_by_country(self):
+        from apps.safex.tests.factories import CompanyAddressFactory
+        company_dz = CompanyFactory()
+        company_ma = CompanyFactory()
+        CompanyAddressFactory(company=company_dz, country="Algeria")
+        CompanyAddressFactory(company=company_ma, country="Morocco")
+
+        result = list(CompanyService.get_companies_by_country("Algeria"))
+        ids    = [c.id for c in result]
+        assert company_dz.id in ids
+        assert company_ma.id not in ids
+
+    def test_combined_filter_returns_distinct(self):
+        ts   = TradeShowFactory(exhibition_year=2024)
+        c    = make_full_company(trade_show=ts)
+        # Two documents for same company / same trade show
+        doc2 = DocumentFactory(trade_show=ts)
+        CompanyDoc.objects.create(company=c, document=doc2)
+
+        result = list(CompanyService.get_companies_filtered(
+            trade_show_id=ts.id, year=2024
+        ))
+        # Must return 1, not 2 (distinct must work)
+        assert result.count(result[0]) == 1
+
+    def test_combined_filter_search(self):
+        CompanyFactory(legal_name="Temacina SARL")
+        CompanyFactory(legal_name="Other Corp")
+
+        result = list(CompanyService.get_companies_filtered(search="Temacina"))
+        assert len(result) == 1
+        assert "Temacina" in result[0].legal_name
+
+
+@pytest.mark.django_db
+class TestCompanyServiceContactData:
+
+    def test_get_company_phones_returns_company_level(self):
+        company = CompanyFactory()
+        phone   = PhoneFactory()
+        CompanyPhone.objects.create(company=company, phone=phone)
+
+        data = CompanyService.get_company_phones(company.id)
+        numbers = [p["full_phone_number"] for p in data["company_phones"]]
+        assert phone.full_phone_number in numbers
+
+    def test_get_company_phones_returns_contact_level(self):
+        from apps.safex.tests.factories import CompanyContactFactory
+        from apps.safex.models import CompanyContactPhone
+        company = CompanyFactory()
+        contact = CompanyContactFactory(company=company)
+        phone   = PhoneFactory()
+        CompanyContactPhone.objects.create(company_contact=contact, phone=phone)
+
+        data = CompanyService.get_company_phones(company.id)
+        numbers = [p["full_phone_number"] for p in data["contact_phones"]]
+        assert phone.full_phone_number in numbers
+
+    def test_get_company_emails_returns_company_level(self):
+        company = CompanyFactory()
+        email   = EmailFactory()
+        CompanyEmail.objects.create(company=company, email=email)
+
+        data = CompanyService.get_company_emails(company.id)
+        addresses = [e["email_address"] for e in data["company_emails"]]
+        assert email.email_address in addresses
+
+    def test_get_company_emails_returns_contact_level(self):
+        from apps.safex.tests.factories import CompanyContactFactory
+        from apps.safex.models import CompanyContactEmail
+        company = CompanyFactory()
+        contact = CompanyContactFactory(company=company)
+        email   = EmailFactory()
+        CompanyContactEmail.objects.create(company_contact=contact, email=email)
+
+        data = CompanyService.get_company_emails(company.id)
+        addresses = [e["email_address"] for e in data["contact_emails"]]
+        assert email.email_address in addresses
+
+    def test_get_company_full_profile_structure(self):
+        company = make_full_company()
+        profile = CompanyService.get_company_full_profile(company.id)
+
+        assert profile is not None
+        assert profile["id"]         == company.id
+        assert profile["legal_name"] == company.legal_name
+        assert "addresses"           in profile
+        assert "phones"              in profile
+        assert "emails"              in profile
+        assert "contacts"            in profile
+        assert "trade_shows"         in profile
+
+    def test_get_company_full_profile_none_for_missing(self):
+        profile = CompanyService.get_company_full_profile(99999999)
+        assert profile is None
+
+    def test_get_company_full_profile_is_cached(self):
+        from django.core.cache import cache
+        company = make_full_company()
+        cache.clear()
+
+        profile1 = CompanyService.get_company_full_profile(company.id)
+        cache_key = f"company:full_profile:{company.id}"
+        assert cache.get(cache_key) is not None   # must be in cache
+
+        profile2 = CompanyService.get_company_full_profile(company.id)
+        assert profile1 == profile2   # same data served from cache
+
+    def test_company_count_per_trade_show(self):
+        ts = TradeShowFactory()
+        make_full_company(trade_show=ts)
+        make_full_company(trade_show=ts)
+
+        data = CompanyService.get_company_count_per_trade_show()
+        assert isinstance(data, list)
+        assert len(data) > 0
+        for entry in data:
+            assert "company_count" in entry
+
+
+@pytest.mark.django_db
+class TestTradeShowService:
+
+    def test_get_all_trade_shows(self):
+        TradeShowFactory(exhibition_year=2024)
+        TradeShowFactory(exhibition_year=2022)
+        from apps.safex.models import TradeShow
+        count = TradeShow.objects.count()
+        result = TradeShowService.get_all_trade_shows()
+        assert result.count() == count
+
+    def test_get_trade_show_stats_keys(self):
+        ts  = TradeShowFactory()
+        make_full_company(trade_show=ts)
+
+        stats = TradeShowService.get_trade_show_stats(ts.id)
+        assert stats["id"]             == ts.id
+        assert stats["name"]           == ts.name
+        assert stats["year"]           == ts.exhibition_year
+        assert "document_count"        in stats
+        assert "company_count"         in stats
+        assert "docs_by_type"          in stats
+        assert "ingestion_status"      in stats
+
+    def test_get_trade_show_stats_cached(self):
+        from django.core.cache import cache
+        ts = TradeShowFactory()
+        cache.clear()
+
+        TradeShowService.get_trade_show_stats(ts.id)
+        cache_key = f"trade_show:stats:{ts.id}"
+        assert cache.get(cache_key) is not None
+
+
+@pytest.mark.django_db
+class TestAnalyticsService:
+
+    def test_get_dashboard_kpis_structure(self):
+        make_full_company()
+        kpis = AnalyticsService.get_dashboard_kpis()
+
+        for key in ["total_companies", "total_trade_shows", "total_documents",
+                    "total_emails", "total_phones", "companies_by_year",
+                    "docs_by_status", "companies_by_country", "companies_by_sector"]:
+            assert key in kpis, f"Missing KPI key: {key}"
+
+    def test_get_dashboard_kpis_counts_are_positive(self):
+        make_full_company()
+        kpis = AnalyticsService.get_dashboard_kpis()
+        assert kpis["total_companies"]   >= 1
+        assert kpis["total_trade_shows"] >= 1
+        assert kpis["total_documents"]   >= 1
+
+    def test_get_dashboard_kpis_cached(self):
+        from django.core.cache import cache
+        cache.clear()
+        AnalyticsService.get_dashboard_kpis()
+        assert cache.get("dashboard:global_kpis") is not None
+
+    def test_ingestion_progress_percentage(self):
+        ts   = TradeShowFactory()
+        DocumentFactory(trade_show=ts, ingestion_status="done")
+        DocumentFactory(trade_show=ts, ingestion_status="done")
+        DocumentFactory(trade_show=ts, ingestion_status="pending")
+
+        progress = AnalyticsService.get_document_ingestion_progress(ts.id)
+        assert progress["total"]    == 3
+        assert progress["ingested"] == 2
+        assert progress["pending"]  == 1
+        assert progress["pct"]      == 66.7
+
+    def test_ingestion_progress_zero_docs(self):
+        ts = TradeShowFactory()
+        progress = AnalyticsService.get_document_ingestion_progress(ts.id)
+        assert progress["pct"] == 0   # no division by zero
+
+
+@pytest.mark.django_db
+class TestSearchService:
+
+    def test_search_finds_company_by_name(self):
+        CompanyFactory(legal_name="Temacina SARL")
+        CompanyFactory(legal_name="Other Corp")
+
+        results = SearchService.global_search("Temacina")
+        names   = [c["legal_name"] for c in results["companies"]]
+        assert any("Temacina" in n for n in names)
+
+    def test_search_finds_email(self):
+        EmailFactory(email_address="info@safex.dz")
+        results = SearchService.global_search("safex.dz")
+        addresses = [e["email_address"] for e in results["emails"]]
+        assert "info@safex.dz" in addresses
+
+    def test_search_finds_phone(self):
+        from apps.safex.tests.factories import PhoneTypeFactory
+        pt = PhoneTypeFactory()
+        PhoneFactory(phone_type=pt, full_phone_number="+213555123456")
+        results = SearchService.global_search("555123456")
+        numbers = [p["full_phone_number"] for p in results["phones"]]
+        assert "+213555123456" in numbers
+
+    def test_search_too_short_returns_empty_structure(self):
+        # The view rejects queries < 2 chars — service itself doesn't
+        # validate, so the view test covers this path (see test_api.py)
+        results = SearchService.global_search("x")
+        assert "companies" in results
+        assert "emails"    in results
+
+    def test_search_no_results(self):
+        results = SearchService.global_search("ZZZNOMATCH999")
+        assert results["companies"] == []
+        assert results["emails"]    == []
+        assert results["phones"]    == []
+
+
+────────────────────────────────────────────────────────────
+FILE: apps/safex/tests/test_api.py
+────────────────────────────────────────────────────────────
+
+Full HTTP-level integration tests for every endpoint.
+Uses pytest-django's `client` fixture and a pre-authenticated
+user from the users app factories.
+
+import pytest
+from django.urls import reverse
+from rest_framework.test import APIClient
+from apps.users.tests.factories import UserFactory
+from apps.safex.tests.factories import (
+    TradeShowFactory, SectorFactory, DocumentFactory,
+    make_full_company, CompanyFactory, EmailFactory, PhoneFactory,
+    CompanyEmail, CompanyPhone,
+)
+
+
+# ── Shared fixture ────────────────────────────────────────────
+
+@pytest.fixture
+def auth_client():
+    """Returns an APIClient authenticated with a fresh user JWT."""
+    user   = UserFactory()
+    client = APIClient()
+
+    # Obtain JWT token through the login endpoint
+    from django.test import Client as DjangoClient
+    from django.urls import reverse as r
+
+    django_client = DjangoClient()
+    user.set_password("testpass123")
+    user.save()
+
+    resp   = django_client.post(
+        r("auth-login"),
+        {"email": user.email, "password": "testpass123"},
+        content_type="application/json",
+    )
+    token = resp.json()["data"]["access"]
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+    return client
+
+
+@pytest.fixture
+def admin_client():
+    """Returns an APIClient authenticated as an Admin user."""
+    user = UserFactory(role="admin")
+    user.set_password("adminpass123")
+    user.save()
+    client = APIClient()
+
+    from django.test import Client as DjangoClient
+    from django.urls import reverse as r
+    django_client = DjangoClient()
+    resp  = django_client.post(
+        r("auth-login"),
+        {"email": user.email, "password": "adminpass123"},
+        content_type="application/json",
+    )
+    token = resp.json()["data"]["access"]
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+    return client
+
+
+# ── Trade Show Endpoints ──────────────────────────────────────
+
+@pytest.mark.django_db
+class TestTradeShowAPI:
+
+    def test_list_trade_shows_authenticated(self, auth_client):
+        TradeShowFactory.create_batch(3)
+        resp = auth_client.get("/api/v1/trade-shows/")
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+        assert len(resp.json()["data"]) >= 3
+
+    def test_list_trade_shows_requires_auth(self):
+        client = APIClient()
+        resp = client.get("/api/v1/trade-shows/")
+        assert resp.status_code == 401
+
+    def test_filter_trade_shows_by_year(self, auth_client):
+        TradeShowFactory(exhibition_year=2024)
+        TradeShowFactory(exhibition_year=2022)
+        resp = auth_client.get("/api/v1/trade-shows/?exhibition_year=2024")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert all(ts["exhibition_year"] == 2024 for ts in data)
+
+    def test_trade_show_detail(self, auth_client):
+        ts   = TradeShowFactory()
+        resp = auth_client.get(f"/api/v1/trade-shows/{ts.id}/")
+        assert resp.status_code == 200
+        assert resp.json()["data"]["id"] == ts.id
+
+    def test_trade_show_detail_not_found(self, auth_client):
+        resp = auth_client.get("/api/v1/trade-shows/99999/")
+        assert resp.status_code == 404
+
+    def test_trade_show_stats(self, auth_client):
+        ts = TradeShowFactory()
+        make_full_company(trade_show=ts)
+        resp = auth_client.get(f"/api/v1/trade-shows/{ts.id}/stats/")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert "document_count" in data
+        assert "company_count"  in data
+
+    def test_ingestion_progress(self, auth_client):
+        ts = TradeShowFactory()
+        DocumentFactory(trade_show=ts, ingestion_status="done")
+        DocumentFactory(trade_show=ts, ingestion_status="pending")
+        resp = auth_client.get(f"/api/v1/trade-shows/{ts.id}/ingestion-progress/")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["total"]    == 2
+        assert data["ingested"] == 1
+        assert data["pct"]      == 50.0
+
+
+# ── Sector Endpoints ──────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestSectorAPI:
+
+    def test_list_sectors(self, auth_client):
+        SectorFactory.create_batch(4)
+        resp = auth_client.get("/api/v1/sectors/")
+        assert resp.status_code == 200
+        assert len(resp.json()["data"]) >= 4
+
+
+# ── Company Endpoints ─────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestCompanyListAPI:
+
+    def test_list_companies(self, auth_client):
+        make_full_company()
+        resp = auth_client.get("/api/v1/companies/")
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+        assert len(resp.json()["data"]) >= 1
+
+    def test_pagination_meta_present(self, auth_client):
+        make_full_company()
+        resp = auth_client.get("/api/v1/companies/")
+        assert "meta" in resp.json()
+        assert "total" in resp.json()["meta"]
+
+    def test_filter_by_trade_show_id(self, auth_client):
+        ts = TradeShowFactory()
+        c  = make_full_company(trade_show=ts)
+        make_full_company(trade_show=TradeShowFactory())
+
+        resp = auth_client.get(f"/api/v1/companies/?trade_show_id={ts.id}")
+        assert resp.status_code == 200
+        ids = [item["id"] for item in resp.json()["data"]]
+        assert c.id in ids
+
+    def test_filter_by_year(self, auth_client):
+        ts = TradeShowFactory(exhibition_year=2024)
+        c  = make_full_company(trade_show=ts)
+
+        resp = auth_client.get("/api/v1/companies/?year=2024")
+        ids  = [item["id"] for item in resp.json()["data"]]
+        assert c.id in ids
+
+    def test_filter_by_sector(self, auth_client):
+        from apps.safex.models import CompanySector
+        sector  = SectorFactory()
+        company = CompanyFactory()
+        CompanySector.objects.create(company=company, sector=sector)
+
+        resp = auth_client.get(f"/api/v1/companies/?sector_id={sector.id}")
+        assert resp.status_code == 200
+        ids = [item["id"] for item in resp.json()["data"]]
+        assert company.id in ids
+
+    def test_search_by_name(self, auth_client):
+        CompanyFactory(legal_name="SearchableCompany SARL")
+        resp = auth_client.get("/api/v1/companies/?search=SearchableCompany")
+        assert resp.status_code == 200
+        names = [item["legal_name"] for item in resp.json()["data"]]
+        assert any("SearchableCompany" in n for n in names)
+
+    def test_filter_by_country(self, auth_client):
+        from apps.safex.tests.factories import CompanyAddressFactory
+        company = CompanyFactory()
+        CompanyAddressFactory(company=company, country="Algeria")
+        resp = auth_client.get("/api/v1/companies/?country=Algeria")
+        ids  = [item["id"] for item in resp.json()["data"]]
+        assert company.id in ids
+
+    def test_combined_filters(self, auth_client):
+        ts = TradeShowFactory(exhibition_year=2024)
+        c  = make_full_company(trade_show=ts)
+        resp = auth_client.get(
+            f"/api/v1/companies/?trade_show_id={ts.id}&year=2024"
+        )
+        assert resp.status_code == 200
+
+    def test_company_count_per_trade_show(self, auth_client):
+        ts = TradeShowFactory()
+        make_full_company(trade_show=ts)
+        resp = auth_client.get("/api/v1/companies/count-per-trade-show/")
+        assert resp.status_code == 200
+        assert isinstance(resp.json()["data"], list)
+
+
+@pytest.mark.django_db
+class TestCompanyDetailAPI:
+
+    def test_company_detail_full_fields(self, auth_client):
+        company = make_full_company()
+        resp = auth_client.get(f"/api/v1/companies/{company.id}/")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        for field in ["id", "legal_name", "sectors", "addresses",
+                      "phones", "emails", "websites", "contacts", "trade_shows"]:
+            assert field in data, f"Missing field: {field}"
+
+    def test_company_detail_not_found(self, auth_client):
+        resp = auth_client.get("/api/v1/companies/99999999/")
+        assert resp.status_code == 404
+
+    def test_company_profile_cache_endpoint(self, auth_client):
+        company = make_full_company()
+        resp = auth_client.get(f"/api/v1/companies/{company.id}/profile/")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["id"]         == company.id
+        assert data["legal_name"] == company.legal_name
+
+    def test_company_profile_cache_not_found(self, auth_client):
+        resp = auth_client.get("/api/v1/companies/99999999/profile/")
+        assert resp.status_code == 404
+
+    def test_company_phones_endpoint(self, auth_client):
+        company = CompanyFactory()
+        phone   = PhoneFactory()
+        CompanyPhone.objects.create(company=company, phone=phone)
+        resp = auth_client.get(f"/api/v1/companies/{company.id}/phones/")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert "company_phones" in data
+        assert "contact_phones" in data
+        numbers = [p["full_phone_number"] for p in data["company_phones"]]
+        assert phone.full_phone_number in numbers
+
+    def test_company_emails_endpoint(self, auth_client):
+        company = CompanyFactory()
+        email   = EmailFactory()
+        CompanyEmail.objects.create(company=company, email=email)
+        resp = auth_client.get(f"/api/v1/companies/{company.id}/emails/")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert "company_emails" in data
+        addresses = [e["email_address"] for e in data["company_emails"]]
+        assert email.email_address in addresses
+
+
+# ── Document Endpoints ────────────────────────────────────────
+
+@pytest.mark.django_db
+class TestDocumentAPI:
+
+    def test_list_documents(self, auth_client):
+        DocumentFactory.create_batch(3)
+        resp = auth_client.get("/api/v1/documents/")
+        assert resp.status_code == 200
+        assert len(resp.json()["data"]) >= 3
+
+    def test_filter_documents_by_trade_show(self, auth_client):
+        ts  = TradeShowFactory()
+        doc = DocumentFactory(trade_show=ts)
+        DocumentFactory(trade_show=TradeShowFactory())
+        resp = auth_client.get(f"/api/v1/documents/?trade_show_id={ts.id}")
+        ids  = [d["id"] for d in resp.json()["data"]]
+        assert doc.id in ids
+
+    def test_filter_documents_by_status(self, auth_client):
+        DocumentFactory(ingestion_status="done")
+        DocumentFactory(ingestion_status="pending")
+        resp = auth_client.get("/api/v1/documents/?status=done")
+        assert resp.status_code == 200
+        statuses = [d["ingestion_status"] for d in resp.json()["data"]]
+        assert all(s == "done" for s in statuses)
+
+    def test_document_detail(self, auth_client):
+        doc  = DocumentFactory()
+        resp = auth_client.get(f"/api/v1/documents/{doc.id}/")
+        assert resp.status_code == 200
+        assert resp.json()["data"]["id"] == doc.id
+
+
+# ── Dashboard KPI Endpoint ────────────────────────────────────
+
+@pytest.mark.django_db
+class TestDashboardKPIAPI:
+
+    def test_kpi_endpoint_returns_all_keys(self, auth_client):
+        make_full_company()
+        resp = auth_client.get("/api/v1/dashboard/kpis/")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        for key in ["total_companies", "total_trade_shows", "total_documents",
+                    "total_emails", "total_phones", "companies_by_year",
+                    "companies_by_country", "companies_by_sector"]:
+            assert key in data
+
+    def test_kpi_totals_are_integers(self, auth_client):
+        make_full_company()
+        data = auth_client.get("/api/v1/dashboard/kpis/").json()["data"]
+        assert isinstance(data["total_companies"],   int)
+        assert isinstance(data["total_trade_shows"], int)
+        assert isinstance(data["total_documents"],   int)
+
+
+# ── Global Search Endpoint ────────────────────────────────────
+
+@pytest.mark.django_db
+class TestGlobalSearchAPI:
+
+    def test_search_returns_all_result_buckets(self, auth_client):
+        make_full_company()
+        resp = auth_client.get("/api/v1/search/?q=company")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        for bucket in ["companies", "contacts", "emails", "phones"]:
+            assert bucket in data
+
+    def test_search_query_too_short_returns_400(self, auth_client):
+        resp = auth_client.get("/api/v1/search/?q=x")
+        assert resp.status_code == 400
+
+    def test_search_empty_query_returns_400(self, auth_client):
+        resp = auth_client.get("/api/v1/search/")
+        assert resp.status_code == 400
+
+    def test_search_finds_specific_company(self, auth_client):
+        CompanyFactory(legal_name="UniqueTestCompany999")
+        resp = auth_client.get("/api/v1/search/?q=UniqueTestCompany999")
+        names = [c["legal_name"] for c in resp.json()["data"]["companies"]]
+        assert "UniqueTestCompany999" in names
+
+    def test_search_finds_email(self, auth_client):
+        EmailFactory(email_address="unique999@test.dz")
+        resp = auth_client.get("/api/v1/search/?q=unique999")
+        addresses = [e["email_address"] for e in resp.json()["data"]["emails"]]
+        assert "unique999@test.dz" in addresses
+
+    def test_search_requires_auth(self):
+        resp = APIClient().get("/api/v1/search/?q=test")
+        assert resp.status_code == 401
+
+
+# ── Standard JSON Envelope Tests ─────────────────────────────
+
+@pytest.mark.django_db
+class TestResponseEnvelope:
+    """Verify the StandardJSONRenderer wraps every response correctly."""
+
+    def test_success_response_has_correct_envelope(self, auth_client):
+        TradeShowFactory()
+        resp = auth_client.get("/api/v1/trade-shows/")
+        body = resp.json()
+        assert "success" in body
+        assert "data"    in body
+        assert "errors"  in body
+        assert body["success"] is True
+        assert body["errors"]  is None
+
+    def test_error_response_has_correct_envelope(self, auth_client):
+        resp = auth_client.get("/api/v1/trade-shows/99999/")
+        body = resp.json()
+        assert body["success"] is False
+        assert body["data"]    is None
+        assert body["errors"]  is not None
+
+    def test_unauthenticated_response_envelope(self):
+        resp = APIClient().get("/api/v1/trade-shows/")
+        body = resp.json()
+        assert body["success"] is False
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 14 — RUNNING THE TESTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Run all safex tests
+pytest apps/safex/tests/ -v
+
+# Run with coverage report
+pytest apps/safex/tests/ --cov=apps/safex --cov-report=term-missing
+
+# Run only service tests (fast, no HTTP)
+pytest apps/safex/tests/test_services.py -v
+
+# Run only API integration tests
+pytest apps/safex/tests/test_api.py -v
+
+# Run one specific class
+pytest apps/safex/tests/test_api.py::TestCompanyDetailAPI -v
+
+# Run one specific test
+pytest apps/safex/tests/test_services.py::TestSearchService::test_search_finds_company_by_name -v
+
+# Expected output (all passing):
+#   apps/safex/tests/test_models.py   ........ [ 8 tests]
+#   apps/safex/tests/test_services.py ........ [24 tests]
+#   apps/safex/tests/test_api.py      ........ [38 tests]
+#   ─────────────────────────────────────────────────────
+#   TOTAL: 70 tests | 0 failed | target coverage ≥ 80%
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 15 — COMPLETE IMPLEMENTATION ORDER (UPDATED)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  STEP 1   python manage.py startapp safex
+           Add "apps.safex" to LOCAL_APPS
+
+  STEP 2   Write models.py (all 32 models, managed=False)
+           python manage.py check                 ← must pass
+
+  STEP 3   Write apps/safex/admin.py
+           python manage.py runserver
+           Visit /admin/ → verify tables visible  ← smoke test
+
+  STEP 4   Write conftest.py at project root
+           Write apps/safex/tests/factories.py
+           pytest apps/safex/tests/ --collect-only ← must collect
+
+  STEP 5   Write apps/safex/tests/test_models.py
+           pytest apps/safex/tests/test_models.py -v ← all pass
+
+  STEP 6   Write services/company.py
+           Write apps/safex/tests/test_services.py::TestCompanyServiceFilters
+           pytest apps/safex/tests/test_services.py::TestCompanyServiceFilters -v
+
+  STEP 7   Write services/trade_show.py, analytics.py, search.py
+           Write remaining test_services.py classes
+           pytest apps/safex/tests/test_services.py -v ← all pass
+
+  STEP 8   Write api/serializers.py
+           Write api/filters.py
+           Write api/views.py
+           Write api/urls.py
+           Register in config/urls.py
+
+  STEP 9   Write apps/safex/tests/test_api.py
+           pytest apps/safex/tests/test_api.py -v  ← all pass
+
+  STEP 10  pytest apps/safex/tests/ --cov=apps/safex --cov-report=term-missing
+           Coverage must be ≥ 80% before connecting frontend
+
+  STEP 11  Start server, test every endpoint manually with Postman or curl
+           Then connect the frontend — the API is ready.
