@@ -63,14 +63,18 @@ async function handleLogout() {
   router.push({ name: 'login' })
 }
 
-const navItems = [
-  { label: 'Tableau de bord',     to: '/app/dashboard',   icon: LayoutDashboard },
-  { label: 'Entreprises',         to: '/app/companies',   icon: Building2 },
-  { label: "Salons d'exposition", to: '/app/trade-shows', icon: CalendarDays },
-  { label: 'Supports',            to: '/app/supports',    icon: FileText },
-  { label: 'Analyses',            to: '/app/analytics',   icon: BarChart3 },
-  { label: 'Profil',              to: '/app/profile',     icon: User },
-  { label: 'Gestion utilisateurs',   to: '/app/users-management',     icon: Users  },
-  { label: 'Aide',   to: '/app/help',     icon: HelpCircle  },
+const ALL_ITEMS = [
+  { label: 'Tableau de bord',      to: '/app/dashboard',        icon: LayoutDashboard, minRole: 'viewer'    },
+  { label: 'Entreprises',          to: '/app/companies',        icon: Building2,        minRole: 'analyst'   },
+  { label: "Salons d'exposition",  to: '/app/trade-shows',      icon: CalendarDays,     minRole: 'analyst'   },
+  { label: 'Supports',             to: '/app/supports',         icon: FileText,         minRole: 'analyst'   },
+  { label: 'Analyses',             to: '/app/analytics',        icon: BarChart3,        minRole: 'analyst'   },
+  { label: 'Profil',               to: '/app/profile',          icon: User,             minRole: 'viewer'    },
+  { label: 'Gestion utilisateurs', to: '/app/users-management', icon: Users,            minRole: 'admin'     },
+  { label: 'Aide',                 to: '/app/help',             icon: HelpCircle,       minRole: 'viewer'    },
 ]
+
+const navItems = computed(() =>
+  ALL_ITEMS.filter(item => authStore.hasRole(item.minRole))
+)
 </script>
