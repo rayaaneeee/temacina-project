@@ -26,6 +26,8 @@ const routes = [
       { path: '', redirect: '/app/dashboard' },
       { path: 'dashboard', name: 'dashboard', component: () => import('@/views/DashboardView.vue') },
       { path: 'profile', name: 'profile', component: () => import('@/views/ProfileView.vue') },
+
+      { path: 'users-management', name: 'users-management', component: () => import('@/views/UsersManagementView.vue') },
     ],
   },
   { path: '/:pathMatch(.*)*', name: 'not-found', component: () => import('@/views/NotFoundView.vue') },
