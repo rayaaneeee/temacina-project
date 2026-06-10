@@ -209,7 +209,7 @@
                   class="text-xs text-orange-500 hover:text-orange-700 font-medium"
                 >View</button>
                 <template v-if="isAdmin">
-                  <button @click.stop="openEdit(company)" title="Edit"
+                  <button @click.stop="selectAndEdit(company)" title="Edit"
                     class="p-1 rounded hover:bg-orange-100 text-gray-400 hover:text-orange-500 transition-colors">
                     <Pencil class="w-3.5 h-3.5" />
                   </button>
@@ -484,41 +484,152 @@
       </div>
     </div>
 
-    <!-- ── Edit Modal ────────────────────────────────────────── -->
+    <!-- ── Edit Slide-over ───────────────────────────────────── -->
     <Teleport to="body">
       <Transition enter-from-class="opacity-0" enter-active-class="transition duration-150"
         leave-to-class="opacity-0" leave-active-class="transition duration-150">
-        <div v-if="editTarget" class="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div class="absolute inset-0 bg-black/50 backdrop-blur-sm" @click="editTarget = null" />
-          <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-md z-10 overflow-hidden">
-            <div class="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+        <div v-if="editTarget" class="fixed inset-0 z-50 flex">
+          <div class="absolute inset-0 bg-black/40 backdrop-blur-sm" @click="editTarget = null" />
+          <div class="relative ml-auto w-full max-w-md bg-white h-full shadow-2xl flex flex-col z-10">
+
+            <!-- Header -->
+            <div class="flex items-center justify-between px-5 py-4 border-b border-gray-100 flex-shrink-0">
               <div class="flex items-center gap-3">
                 <div class="w-9 h-9 rounded-xl bg-orange-100 flex items-center justify-center">
                   <Pencil class="w-4 h-4 text-orange-500" />
                 </div>
-                <p class="text-sm font-bold text-gray-800">Edit Company</p>
+                <div>
+                  <p class="text-sm font-bold text-gray-800">Edit Company</p>
+                  <p class="text-xs text-gray-400 truncate max-w-52">{{ editTarget.legal_name }}</p>
+                </div>
               </div>
               <button @click="editTarget = null" class="p-1.5 rounded-lg hover:bg-gray-100 text-gray-400">
                 <X class="w-4 h-4" />
               </button>
             </div>
-            <form @submit.prevent="submitEdit" class="p-5 space-y-4">
-              <div>
-                <label class="block text-xs font-medium text-gray-700 mb-1">Company Name <span class="text-red-500">*</span></label>
-                <input v-model="editForm.legal_name" required
+
+            <!-- Scrollable form -->
+            <form @submit.prevent="submitEdit" class="flex-1 overflow-y-auto p-5 space-y-5">
+
+              <!-- Basic Info -->
+              <div class="space-y-3">
+                <p class="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Basic Info</p>
+                <div>
+                  <label class="block text-xs font-medium text-gray-700 mb-1">Company Name <span class="text-red-500">*</span></label>
+                  <input v-model="editForm.legal_name" required
+                    class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-orange-400" />
+                </div>
+              </div>
+
+              <!-- Sector -->
+              <div class="space-y-2">
+                <p class="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Sector</p>
+                <div class="flex flex-wrap gap-2">
+                  <button v-for="s in availableSectors" :key="s.id" type="button"
+                    @click="toggleSector(s.id)"
+                    :class="['px-3 py-1.5 rounded-lg text-xs font-medium border transition-all',
+                      editForm.sector_ids.includes(s.id)
+                        ? 'bg-orange-500 text-white border-orange-500'
+                        : 'border-gray-200 text-gray-600 hover:border-orange-300']">
+                    {{ s.title }}
+                  </button>
+                </div>
+              </div>
+
+              <!-- Address -->
+              <div class="space-y-3">
+                <p class="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Address</p>
+                <div class="grid grid-cols-2 gap-3">
+                  <div class="col-span-2">
+                    <label class="block text-xs font-medium text-gray-700 mb-1">Street</label>
+                    <input v-model="editForm.address.street" placeholder="Street address"
+                      class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-orange-400" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-gray-700 mb-1">City</label>
+                    <input v-model="editForm.address.city" placeholder="City"
+                      class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-orange-400" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-gray-700 mb-1">Postal Code</label>
+                    <input v-model="editForm.address.postal_code" placeholder="00000"
+                      class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-orange-400" />
+                  </div>
+                  <div class="col-span-2">
+                    <label class="block text-xs font-medium text-gray-700 mb-1">Country</label>
+                    <input v-model="editForm.address.country" placeholder="Country"
+                      class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-orange-400" />
+                  </div>
+                </div>
+              </div>
+
+              <!-- Phone Numbers -->
+              <div class="space-y-2">
+                <div class="flex items-center justify-between">
+                  <p class="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Phone Numbers</p>
+                  <button type="button" @click="editForm.phones.push('')"
+                    class="text-xs text-orange-500 hover:text-orange-700 flex items-center gap-1 font-medium">
+                    <Plus class="w-3.5 h-3.5" /> Add
+                  </button>
+                </div>
+                <div v-for="(_, i) in editForm.phones" :key="i" class="flex gap-2">
+                  <input v-model="editForm.phones[i]" placeholder="+213 XX XX XX XX"
+                    class="flex-1 px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-orange-400" />
+                  <button type="button" @click="editForm.phones.splice(i, 1)"
+                    class="p-2 rounded-lg hover:bg-red-50 text-gray-400 hover:text-red-500 transition-colors flex-shrink-0">
+                    <Minus class="w-3.5 h-3.5" />
+                  </button>
+                </div>
+                <button v-if="!editForm.phones.length" type="button" @click="editForm.phones.push('')"
+                  class="w-full py-2 border border-dashed border-gray-300 rounded-lg text-xs text-gray-400 hover:border-orange-400 hover:text-orange-500 transition-colors">
+                  + Add phone number
+                </button>
+              </div>
+
+              <!-- Emails -->
+              <div class="space-y-2">
+                <div class="flex items-center justify-between">
+                  <p class="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Email Addresses</p>
+                  <button type="button" @click="editForm.emails.push('')"
+                    class="text-xs text-orange-500 hover:text-orange-700 flex items-center gap-1 font-medium">
+                    <Plus class="w-3.5 h-3.5" /> Add
+                  </button>
+                </div>
+                <div v-for="(_, i) in editForm.emails" :key="i" class="flex gap-2">
+                  <input v-model="editForm.emails[i]" type="email" placeholder="contact@company.com"
+                    class="flex-1 px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-orange-400" />
+                  <button type="button" @click="editForm.emails.splice(i, 1)"
+                    class="p-2 rounded-lg hover:bg-red-50 text-gray-400 hover:text-red-500 transition-colors flex-shrink-0">
+                    <Minus class="w-3.5 h-3.5" />
+                  </button>
+                </div>
+                <button v-if="!editForm.emails.length" type="button" @click="editForm.emails.push('')"
+                  class="w-full py-2 border border-dashed border-gray-300 rounded-lg text-xs text-gray-400 hover:border-orange-400 hover:text-orange-500 transition-colors">
+                  + Add email address
+                </button>
+              </div>
+
+              <!-- Website -->
+              <div class="space-y-2">
+                <p class="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Website</p>
+                <input v-model="editForm.website" type="url" placeholder="https://www.company.com"
                   class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-orange-400" />
               </div>
+
               <p v-if="editError" class="text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">{{ editError }}</p>
-              <div class="flex gap-3 pt-1">
-                <button type="submit" :disabled="editLoading"
-                  class="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl bg-orange-500 text-white text-sm font-semibold hover:bg-orange-600 transition-colors disabled:opacity-60">
-                  <div v-if="editLoading" class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                  Save Changes
-                </button>
-                <button type="button" @click="editTarget = null"
-                  class="px-4 py-2.5 rounded-xl border border-gray-200 text-sm text-gray-600 hover:bg-gray-50">Cancel</button>
-              </div>
             </form>
+
+            <!-- Footer -->
+            <div class="border-t border-gray-100 p-4 flex gap-3 flex-shrink-0">
+              <button type="button" @click="submitEdit" :disabled="editLoading"
+                class="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl bg-orange-500 text-white text-sm font-semibold hover:bg-orange-600 transition-colors disabled:opacity-60">
+                <div v-if="editLoading" class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                <Check v-else class="w-4 h-4" />
+                Save Changes
+              </button>
+              <button type="button" @click="editTarget = null"
+                class="px-4 py-2.5 rounded-xl border border-gray-200 text-sm text-gray-600 hover:bg-gray-50">Cancel</button>
+            </div>
           </div>
         </div>
       </Transition>
@@ -623,7 +734,7 @@ import { RouterLink } from 'vue-router'
 import {
   Search, RotateCcw, Building2, Download,
   ExternalLink, Phone, Mail, Share2, FileText, Table2, X,
-  Pencil, Trash2,
+  Pencil, Trash2, Plus, Minus, Check,
 } from '@lucide/vue'
 import { useCompaniesStore } from '@/stores/companies'
 import { useAuthStore }      from '@/stores/auth'
@@ -644,26 +755,66 @@ const years = [2026, 2025, 2024, 2023, 2022]
 
 // ── Edit ──────────────────────────────────────────────────────
 const editTarget  = ref(null)
-const editForm    = ref({ legal_name: '' })
+const editForm    = ref({})
 const editLoading = ref(false)
 const editError   = ref('')
 
+// Sectors available for selection — use the store's already-loaded list
+const availableSectors = computed(() => store.sectors ?? [])
+
+function toggleSector(id) {
+  const ids = editForm.value.sector_ids
+  const idx = ids.indexOf(id)
+  if (idx === -1) ids.push(id)
+  else ids.splice(idx, 1)
+}
+
 function openEdit(company) {
   editTarget.value = company
-  editForm.value   = { legal_name: company.legal_name }
-  editError.value  = ''
+  // Populate form from current company data (detail object preferred)
+  const detail = store.selectedCompany?.id === company.id ? store.selectedCompany : company
+  const addr   = detail.addresses?.[0] ?? {}
+  editForm.value = {
+    legal_name:  detail.legal_name ?? '',
+    sector_ids:  (detail.sectors ?? []).map(s => s.id),
+    address: {
+      street:      addr.street      ?? '',
+      city:        addr.city        ?? '',
+      country:     addr.country     ?? '',
+      postal_code: addr.postal_code ?? '',
+    },
+    phones:  (detail.phones  ?? []).map(p => p.full_phone_number ?? p.phone_number ?? ''),
+    emails:  (detail.emails  ?? []).map(e => e.email_address ?? ''),
+    website: detail.websites?.[0]?.url ?? '',
+  }
+  editError.value = ''
+}
+
+// Fetch full detail first so phones/emails/websites are available in the form
+async function selectAndEdit(company) {
+  await store.selectCompany(company)
+  openEdit(store.selectedCompany)
 }
 
 async function submitEdit() {
   editLoading.value = true
   editError.value   = ''
   try {
-    await api.patch(`/companies/${editTarget.value.id}/`, editForm.value)
-    // update in-store
+    // Strip empty strings from list fields
+    const payload = {
+      ...editForm.value,
+      phones: editForm.value.phones.map(p => p.trim()).filter(Boolean),
+      emails: editForm.value.emails.map(e => e.trim()).filter(Boolean),
+    }
+    const updated = await api.patch(`/companies/${editTarget.value.id}/`, payload)
+    // Refresh selected company so detail panel updates
+    const fresh = updated?.data ?? updated
+    if (store.selectedCompany?.id === editTarget.value.id && fresh) {
+      Object.assign(store.selectedCompany, fresh)
+    }
+    // Update list-row name
     const c = store.companies.find(c => c.id === editTarget.value.id)
-    if (c) c.legal_name = editForm.value.legal_name
-    if (store.selectedCompany?.id === editTarget.value.id)
-      store.selectedCompany.legal_name = editForm.value.legal_name
+    if (c) c.legal_name = payload.legal_name
     editTarget.value = null
   } catch (e) {
     editError.value = e.message ?? 'Failed to update company'

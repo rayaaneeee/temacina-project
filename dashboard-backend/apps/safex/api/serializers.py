@@ -83,11 +83,36 @@ class CompanyDetailSerializer(serializers.ModelSerializer):
             for d in obj.documents.select_related("trade_show").all()
         })
 
-class CompanyWriteSerializer(serializers.ModelSerializer):
-    """Used for PATCH updates — only allows safe scalar fields."""
-    class Meta:
-        model  = Company
-        fields = ["legal_name", "logo"]
+class CompanyWriteSerializer(serializers.Serializer):
+    """
+    Used for PATCH /companies/{id}/.
+    Accepts all editable company fields including nested address,
+    phone list, email list, website and sector assignments.
+    """
+    legal_name  = serializers.CharField(max_length=255, required=False)
+    logo        = serializers.CharField(max_length=500, required=False, allow_null=True, allow_blank=True)
+
+    # Address (first address only for simplicity)
+    address = serializers.DictField(required=False, allow_null=True)
+    # e.g. {"street": "...", "city": "...", "country": "...", "postal_code": "..."}
+
+    # Replace phone list with full_phone_number strings
+    phones = serializers.ListField(
+        child=serializers.CharField(max_length=60), required=False, allow_null=True
+    )
+
+    # Replace email list
+    emails = serializers.ListField(
+        child=serializers.EmailField(), required=False, allow_null=True
+    )
+
+    # Replace website (single URL)
+    website = serializers.URLField(required=False, allow_null=True, allow_blank=True, max_length=500)
+
+    # Replace sector assignments
+    sector_ids = serializers.ListField(
+        child=serializers.IntegerField(), required=False, allow_null=True
+    )
 
 class ContactListSerializer(serializers.ModelSerializer):
     """Flat serializer for the /contacts/ list endpoint."""
