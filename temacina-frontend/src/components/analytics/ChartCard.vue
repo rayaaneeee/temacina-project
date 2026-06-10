@@ -27,7 +27,7 @@
 </template>
 
 <script setup>
-import { BarChart2 } from 'lucide-vue-next'
+import { BarChart2 } from '@lucide/vue'
 
 defineProps({
   title:    { type: String,  required: true },

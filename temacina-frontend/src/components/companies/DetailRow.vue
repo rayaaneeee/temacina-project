@@ -16,11 +16,15 @@
 import { computed } from 'vue'
 import {
   User, Briefcase, MapPin, Globe, Hash,
-  Phone, Mail, Link,
-} from 'lucide-vue-next'
+  Phone, Mail, Link, FileText, Share2, Users,
+} from '@lucide/vue'
 
 const props = defineProps({ icon: String, label: String })
 
-const iconMap = { User, Briefcase, MapPin, Globe, Hash, Phone, Mail, Link }
+const iconMap = {
+  User, Briefcase, MapPin, Globe, Hash,
+  Phone, Mail, Link, FileText, Share2, Users,
+  Linkedin: Share2, Twitter: Share2, Facebook: Share2, Instagram: Share2,
+}
 const iconComponent = computed(() => iconMap[props.icon] ?? User)
 </script>

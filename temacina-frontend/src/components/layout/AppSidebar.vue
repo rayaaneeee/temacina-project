@@ -58,12 +58,12 @@
 </template>
 
 <script setup>
+import { computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import {
   LayoutDashboard, Building2, Users, CalendarDays,
   FileText, Globe, BarChart3, Download, Settings, LogOut, User,
-  Users2,
   HelpCircle,
 } from '@lucide/vue'
 
@@ -75,16 +75,17 @@ async function handleLogout() {
   router.push({ name: 'login' })
 }
 
-const navItems = [
-  { label: 'Dashboard',   to: '/app/dashboard',   icon: LayoutDashboard },
-  { label: 'Companies',   to: '/app/companies',   icon: Building2 },
-  { label: 'Contacts',    to: '/app/contacts',    icon: Users },
-  { label: 'Trade Shows', to: '/app/trade-shows', icon: CalendarDays },
-  { label: 'Documents',   to: '/app/supports',    icon: FileText },
-  { label: 'Countries',   to: '/app/countries',   icon: Globe },
-  { label: 'Analytics',   to: '/app/analytics',   icon: BarChart3 },
-  { label: 'Exports',     to: '/app/exports',     icon: Download },
-  { label: 'Settings',    to: '/app/settings',    icon: Settings },
+const ALL_ITEMS = [
+  { label: 'Dashboard',   to: '/app/dashboard',   icon: LayoutDashboard, minRole: 'viewer'  },
+  { label: 'Companies',   to: '/app/companies',   icon: Building2,       minRole: 'viewer'  },
+  { label: 'Contacts',    to: '/app/contacts',    icon: Users,           minRole: 'viewer'  },
+  { label: 'Trade Shows', to: '/app/trade-shows', icon: CalendarDays,    minRole: 'viewer'  },
+  { label: 'Documents',   to: '/app/supports',    icon: FileText,        minRole: 'viewer'  },
+  { label: 'Countries',   to: '/app/countries',   icon: Globe,           minRole: 'viewer'  },
+  { label: 'Analytics',   to: '/app/analytics',   icon: BarChart3,       minRole: 'analyst' },
+  { label: 'Exports',     to: '/app/exports',     icon: Download,        minRole: 'analyst' },
+  { label: 'Settings',    to: '/app/settings',    icon: Settings,        minRole: 'admin'   },
+  { label: 'Help',        to: '/app/help',        icon: HelpCircle,      minRole: 'viewer'  },
 ]
 
 const navItems = computed(() =>

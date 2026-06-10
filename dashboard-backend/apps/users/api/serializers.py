@@ -67,7 +67,7 @@ class UserUpdateSerializer(serializers.Serializer):
     first_name = serializers.CharField(max_length=255, required=False)
     last_name  = serializers.CharField(max_length=255, required=False)
     phone      = serializers.CharField(max_length=30,  required=False,
-                                       allow_null=True)
+                                       allow_null=True, allow_blank=True)
     sector_id  = serializers.IntegerField(required=False, allow_null=True)
     manager_id = serializers.IntegerField(required=False, allow_null=True)
     role_id    = serializers.IntegerField(required=False)  # admin only

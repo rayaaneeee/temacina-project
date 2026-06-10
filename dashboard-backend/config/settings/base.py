@@ -85,7 +85,6 @@ CACHES = {
         "LOCATION": config("REDIS_URL", default="redis://localhost:6379/0"),
         "OPTIONS": {
             "CLIENT_CLASS": "django_redis.client.DefaultClient",
-            "PARSER_CLASS": "redis.connection.HiredisParser",
             "CONNECTION_POOL_KWARGS": {"max_connections": 50},
         },
         "KEY_PREFIX": "dashboard",

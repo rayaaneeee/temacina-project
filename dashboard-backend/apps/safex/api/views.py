@@ -54,12 +54,20 @@ class CompanyListView(generics.ListAPIView):
     search_fields = ["legal_name", "normalized_legal_name"]
     ordering_fields = ["legal_name"]
     ordering = ["legal_name"]
-    def get_queryset(self):
+    def filter_queryset(self, queryset):
+        # Apply filter/search/ordering backends first, then deduplicate via subquery
+        qs = super().filter_queryset(queryset)
+        ids = qs.values_list("id", flat=True).distinct()
+        ordering = qs.query.order_by or ["legal_name"]
         return (
             Company.objects
+            .filter(id__in=ids)
             .prefetch_related("sectors", "addresses")
-            .distinct()
+            .order_by(*ordering)
         )
+
+    def get_queryset(self):
+        return Company.objects.prefetch_related("sectors", "addresses")
 
 class CompanyDetailView(generics.RetrieveAPIView):
     serializer_class = CompanyDetailSerializer

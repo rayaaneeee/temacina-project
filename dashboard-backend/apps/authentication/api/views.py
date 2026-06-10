@@ -101,16 +101,3 @@ class ChangePasswordView(APIView):
 def _get_ip(request):
     xff = request.META.get("HTTP_X_FORWARDED_FOR")
     return xff.split(",")[0].strip() if xff else request.META.get("REMOTE_ADDR")
-
-
-class ChangePasswordView(APIView):
-    def post(self, request):
-        serializer = ChangePasswordSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        user = request.user
-        if not user.check_password(serializer.validated_data["old_password"]):
-            return Response({"detail": "Old password incorrect."},
-                            status=status.HTTP_400_BAD_REQUEST)
-        user.set_password(serializer.validated_data["new_password"])
-        user.save(update_fields=["password"])
-        return Response({"detail": "Password updated."})

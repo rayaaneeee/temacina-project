@@ -1,16 +1,16 @@
 import { defineStore } from 'pinia'
-import { ref, computed, watch } from 'vue'
-import { mockCompanies, mockTradeShows, mockKpis } from '@/data/mockData'
+import { ref, computed } from 'vue'
+import api from '@/services/api'
 
 export const useCompaniesStore = defineStore('companies', () => {
   // ── Filter state ─────────────────────────────────────────────
   const filters = ref({
-    sectors:     [],
-    years:       [],
-    trade_shows: [],
-    supports:    [],
-    countries:   [],
-    search:      '',
+    sector_id:      null,
+    year:           null,
+    trade_show_id:  null,
+    country:        '',
+    search:         '',
+    ordering:       'legal_name',
   })
 
   // ── Pagination ───────────────────────────────────────────────
@@ -22,83 +22,116 @@ export const useCompaniesStore = defineStore('companies', () => {
   })
 
   // ── Data ─────────────────────────────────────────────────────
-  const allCompanies    = ref(mockCompanies)
   const companies       = ref([])
   const selectedCompany = ref(null)
   const loading         = ref(false)
-  const tradeShows      = ref(mockTradeShows)
-  const kpis            = ref(mockKpis)
+  const sectors         = ref([])
+  const tradeShows      = ref([])
+  const countries       = ref([])
 
   // ── Getters ──────────────────────────────────────────────────
   const activeFiltersCount = computed(() => {
     const f = filters.value
     return (
-      f.sectors.length + f.years.length + f.trade_shows.length +
-      f.supports.length + f.countries.length + (f.search ? 1 : 0)
+      (f.sector_id     ? 1 : 0) +
+      (f.year          ? 1 : 0) +
+      (f.trade_show_id ? 1 : 0) +
+      (f.country       ? 1 : 0) +
+      (f.search        ? 1 : 0)
     )
   })
 
   const filterSummary = computed(() => {
-    const f = filters.value
+    const f   = filters.value
     const parts = []
-    if (f.sectors.length)     parts.push({ label: 'Secteurs',  value: f.sectors.join(', ') })
-    if (f.years.length)       parts.push({ label: 'Années',    value: f.years.join(', ') })
-    if (f.trade_shows.length) parts.push({ label: 'Salons',    value: f.trade_shows.join(', ') })
-    if (f.supports.length)    parts.push({ label: 'Supports',  value: f.supports.join(', ') })
-    if (f.countries.length)   parts.push({ label: 'Pays',      value: f.countries.join(', ') })
-    if (f.search)             parts.push({ label: 'Recherche', value: f.search })
+    if (f.sector_id) {
+      const s = sectors.value.find(x => x.id === f.sector_id)
+      if (s) parts.push({ label: 'Sector', value: s.title })
+    }
+    if (f.year)          parts.push({ label: 'Year',       value: f.year })
+    if (f.trade_show_id) {
+      const ts = tradeShows.value.find(x => x.id === f.trade_show_id)
+      if (ts) parts.push({ label: 'Trade Show', value: ts.name })
+    }
+    if (f.country)       parts.push({ label: 'Country',    value: f.country })
+    if (f.search)        parts.push({ label: 'Search',     value: f.search })
     return parts
   })
 
   // ── Actions ──────────────────────────────────────────────────
-  function fetchCompanies() {
+  async function fetchSectors() {
+    try {
+      const res = await api.get('/sectors/')
+      sectors.value = res?.data ?? (Array.isArray(res) ? res : [])
+    } catch {}
+  }
+
+  async function fetchTradeShows() {
+    try {
+      const res = await api.get('/trade-shows/')
+      tradeShows.value = res?.data ?? (Array.isArray(res) ? res : [])
+    } catch {}
+  }
+
+  async function fetchCompanies() {
     loading.value = true
-    setTimeout(() => {
-      let result = [...allCompanies.value]
-      const f = filters.value
+    try {
+      const f      = filters.value
+      const params = {
+        page:      pagination.value.page,
+        page_size: pagination.value.pageSize,
+        ordering:  f.ordering,
+      }
+      if (f.sector_id)     params.sector_id     = f.sector_id
+      if (f.year)          params.year           = f.year
+      if (f.trade_show_id) params.trade_show_id  = f.trade_show_id
+      if (f.country)       params.country        = f.country
+      if (f.search)        params.search         = f.search
 
-      if (f.sectors.length)
-        result = result.filter(c => c.sectors.some(s => f.sectors.includes(s)))
-      if (f.countries.length)
-        result = result.filter(c =>
-          c.addresses.some(a => f.countries.includes(a.country)))
-      if (f.trade_shows.length)
-        result = result.filter(c =>
-          c.trade_shows.some(ts => f.trade_shows.includes(ts)))
-      if (f.search)
-        result = result.filter(c =>
-          c.legal_name.toLowerCase().includes(f.search.toLowerCase()))
+      const res = await api.get('/companies/', { params })
 
-      pagination.value.total      = result.length
-      pagination.value.totalPages = Math.ceil(result.length / pagination.value.pageSize)
+      // Backend wraps paginated responses as { data: [...], meta: { total, total_pages, ... } }
+      const list = res?.data ?? (Array.isArray(res) ? res : [])
+      const meta = res?.meta ?? {}
 
-      const start = (pagination.value.page - 1) * pagination.value.pageSize
-      companies.value = result.slice(start, start + pagination.value.pageSize)
-      loading.value   = false
-    }, 300)
+      pagination.value.total      = meta.total      ?? list.length
+      pagination.value.totalPages = meta.total_pages ?? Math.ceil(list.length / pagination.value.pageSize)
+      companies.value             = list
+
+      // Build distinct country list from results
+      const seen = new Set(countries.value)
+      list.forEach(c => { if (c.country) seen.add(c.country) })
+      countries.value = [...seen].sort()
+    } catch {
+      companies.value = []
+    } finally {
+      loading.value = false
+    }
   }
 
-  function selectCompany(company) {
-    selectedCompany.value = company
-  }
-
-  function toggleFilterItem(key, item) {
-    const arr = filters.value[key]
-    const idx = arr.indexOf(item)
-    if (idx > -1) arr.splice(idx, 1)
-    else arr.push(item)
-    pagination.value.page = 1
+  async function selectCompany(company) {
+    // Always fetch full detail from API
+    selectedCompany.value = company // optimistic
+    try {
+      const detail = await api.get(`/companies/${company.id}/`)
+      selectedCompany.value = detail
+    } catch {}
   }
 
   function setFilter(key, value) {
     filters.value[key]    = value
     pagination.value.page = 1
+    fetchCompanies()
   }
 
   function resetFilters() {
     filters.value = {
-      sectors: [], years: [], trade_shows: [],
-      supports: [], countries: [], search: '',
+      sector_id:     null,
+      year:          null,
+      trade_show_id: null,
+      country:       '',
+      search:        '',
+      ordering:      'legal_name',
     }
     pagination.value.page = 1
     fetchCompanies()
@@ -115,38 +148,78 @@ export const useCompaniesStore = defineStore('companies', () => {
     fetchCompanies()
   }
 
+  function setOrdering(field) {
+    filters.value.ordering =
+      filters.value.ordering === field ? `-${field}` : field
+    pagination.value.page  = 1
+    fetchCompanies()
+  }
+
   function exportCsv() {
-    const headers = ['ID', 'Nom', 'Secteur', 'Ville', 'Pays', 'Téléphone', 'Email']
+    const headers = ['ID', 'Company', 'Sector', 'Country', 'Phone', 'Email']
     const rows = companies.value.map(c => [
       c.id,
       c.legal_name,
-      c.sectors.join('/'),
-      c.addresses[0]?.city ?? '',
-      c.addresses[0]?.country ?? '',
-      c.phones[0]?.number ?? '',
-      c.emails[0]?.address ?? '',
+      Array.isArray(c.sectors) ? c.sectors.map(s => s.title ?? s).join('/') : '',
+      c.country ?? c.addresses?.[0]?.country ?? '',
+      c.phones?.[0]?.full_phone_number ?? c.phones?.[0]?.number ?? '',
+      c.emails?.[0]?.email_address ?? c.emails?.[0]?.address ?? '',
     ])
-    const csv = [headers, ...rows].map(r => r.join(',')).join('\n')
-    const blob = new Blob([csv], { type: 'text/csv' })
+    const csv = [headers, ...rows].map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n')
+    downloadBlob(csv, 'text/csv', `temacina_companies_${Date.now()}.csv`)
+  }
+
+  function exportExcel() {
+    // Build minimal XLSX-compatible XML (SpreadsheetML)
+    const headers = ['ID', 'Company', 'Sector', 'Country', 'Phone', 'Email']
+    const rows = companies.value.map(c => [
+      c.id,
+      c.legal_name,
+      Array.isArray(c.sectors) ? c.sectors.map(s => s.title ?? s).join('/') : '',
+      c.country ?? c.addresses?.[0]?.country ?? '',
+      c.phones?.[0]?.full_phone_number ?? c.phones?.[0]?.number ?? '',
+      c.emails?.[0]?.email_address ?? c.emails?.[0]?.address ?? '',
+    ])
+
+    const esc = v => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    const toRow = cells =>
+      `<Row>${cells.map(c => `<Cell><Data ss:Type="String">${esc(c)}</Data></Cell>`).join('')}</Row>`
+
+    const xml = `<?xml version="1.0"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
+          xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+  <Worksheet ss:Name="Companies">
+    <Table>
+      ${toRow(headers)}
+      ${rows.map(toRow).join('\n      ')}
+    </Table>
+  </Worksheet>
+</Workbook>`
+    downloadBlob(xml, 'application/vnd.ms-excel', `temacina_companies_${Date.now()}.xls`)
+  }
+
+  function downloadBlob(content, mime, filename) {
+    const blob = new Blob([content], { type: mime })
     const url  = URL.createObjectURL(blob)
     const a    = document.createElement('a')
     a.href     = url
-    a.download = `temacina_export_${Date.now()}.csv`
+    a.download = filename
     a.click()
     URL.revokeObjectURL(url)
   }
 
-  // Auto-fetch when filters change
-  watch(filters, fetchCompanies, { deep: true })
-
   // Initialize
+  fetchSectors()
+  fetchTradeShows()
   fetchCompanies()
 
   return {
     filters, pagination, companies, selectedCompany,
-    loading, tradeShows, kpis, activeFiltersCount, filterSummary,
-    allCompanies,
-    fetchCompanies, selectCompany, toggleFilterItem,
-    setFilter, resetFilters, setPage, setPageSize, exportCsv,
+    loading, sectors, tradeShows, countries,
+    activeFiltersCount, filterSummary,
+    fetchCompanies, fetchSectors, fetchTradeShows,
+    selectCompany, setFilter, resetFilters,
+    setPage, setPageSize, setOrdering,
+    exportCsv, exportExcel,
   }
 })

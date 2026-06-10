@@ -102,7 +102,7 @@
 
 <script setup>
 import { computed } from 'vue'
-import { Users, ChevronLeft, ChevronRight } from 'lucide-vue-next'
+import { Users, ChevronLeft, ChevronRight } from '@lucide/vue'
 import UserTableRow from './tablerow.vue'
 
 const props = defineProps({

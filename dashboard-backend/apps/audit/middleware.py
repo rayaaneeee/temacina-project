@@ -1,3 +1,6 @@
-# Audit middleware for request/response logging
-# Logs HTTP requests and responses for security audit trail
+class AuditLogMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
 
+    def __call__(self, request):
+        return self.get_response(request)

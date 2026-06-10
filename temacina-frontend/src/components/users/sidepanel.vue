@@ -106,7 +106,7 @@
 
 <script setup>
 import { computed, defineComponent, h } from 'vue'
-import { X, Pencil, ShieldCheck, Trash2, UserX, UserCheck, Phone, Building2, User, Calendar } from 'lucide-vue-next'
+import { X, Pencil, ShieldCheck, Trash2, UserX, UserCheck, Phone, Building2, User, Calendar } from '@lucide/vue'
 import UserAvatar from './avatar.vue'
 import UserRoleBadge from './rolebadge.vue'
 import UserStatusBadge from './statusbadge.vue'

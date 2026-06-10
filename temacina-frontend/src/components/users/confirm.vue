@@ -41,7 +41,7 @@
 </template>
 
 <script setup>
-import { Trash2, AlertCircle } from 'lucide-vue-next'
+import { Trash2, AlertCircle } from '@lucide/vue'
 
 defineProps({
   open:    { type: Boolean, default: false },

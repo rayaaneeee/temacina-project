@@ -8,8 +8,13 @@ export const useAuthStore = defineStore('auth', () => {
   const error        = ref(null)
 
   const isAuthenticated = computed(() => !!sessionStorage.getItem('access_token'))
-  const userRole        = computed(() => user.value?.role ?? null)
-  const userName        = computed(() => user.value?.full_name ?? user.value?.email ?? '')
+  const userRole        = computed(() => user.value?.role?.name ?? user.value?.role ?? null)
+  const userName        = computed(() => {
+    const u = user.value
+    if (!u) return ''
+    if (u.first_name || u.last_name) return `${u.first_name ?? ''} ${u.last_name ?? ''}`.trim()
+    return u.full_name ?? u.email ?? ''
+  })
 
   const HIERARCHY = ['viewer', 'analyst', 'manager', 'admin', 'superadmin']
   const hasRole = (required) => {

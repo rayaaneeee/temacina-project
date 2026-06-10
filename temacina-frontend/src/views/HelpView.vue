@@ -254,7 +254,7 @@ import {
   LifeBuoy, Search, ChevronRight, ChevronLeft, ArrowRight,
   BookOpen, Rocket, ShieldCheck, Users, BarChart2, Settings,
   Mail, MessageSquare, Phone, Bot, X, Send, ThumbsUp, ThumbsDown,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 
 // ── Sub-component: ArticleCard ─────────────────────────────────────────
 const ArticleCard = {

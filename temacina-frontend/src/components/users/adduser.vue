@@ -98,7 +98,7 @@
 
 <script setup>
 import { ref, watch } from 'vue'
-import { UserPlus, X, AlertCircle } from 'lucide-vue-next'
+import { UserPlus, X, AlertCircle } from '@lucide/vue'
 
 const ROLE_LABELS = {
   viewer:     'Lecteur',

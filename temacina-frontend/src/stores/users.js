@@ -1,38 +1,21 @@
-/**
- * src/stores/users.js
- * Pinia store for the User Management page.
- * Accessible only by admin / superadmin (enforced by the router guard
- * AND by every backend endpoint).
- */
-import { storeToRefs } from 'pinia'
+import { defineStore } from 'pinia'
+import { ref, computed } from 'vue'
+import UsersService from '@/services/user.services'
 
-const store = useUsersStore()
-const { users, roles, sectors, loading, error, pagination, filters, modal } = storeToRefs(store)
-const { fetchUsers, fetchReferenceData, inviteUser, updateUser,
-        changeRole, toggleStatus, deactivateUser,
-        setFilter, resetFilters, setPage, openModal, closeModal } = store
+const ROLE_HIERARCHY = ['viewer', 'analyst', 'manager', 'admin', 'superadmin']
 
 export const useUsersStore = defineStore('users', () => {
 
   // ── State ────────────────────────────────────────────────────────
   const users       = ref([])
-  const roles       = ref([])       // [{ id, name }]
-  const sectors     = ref([])       // [{ id, name }]
+  const roles       = ref([])
+  const sectors     = ref([])
   const loading     = ref(false)
   const error       = ref(null)
 
-  // Pagination
   const pagination  = ref({ page: 1, pageSize: 15, total: 0, totalPages: 0 })
-
-  // Filters
   const filters     = ref({ role: '', sector_id: '', search: '' })
-
-  // Modal state
-  const modal       = ref({
-    type: null,   // 'invite' | 'edit' | 'changeRole' | 'confirm'
-    user: null,   // target user object
-    open: false,
-  })
+  const modal       = ref({ type: null, user: null, open: false })
 
   // ── Getters ──────────────────────────────────────────────────────
 
@@ -44,7 +27,6 @@ export const useUsersStore = defineStore('users', () => {
 
   // ── Actions ──────────────────────────────────────────────────────
 
-  /** Load users with current filters + pagination. */
   async function fetchUsers() {
     loading.value = true
     error.value   = null
@@ -52,22 +34,17 @@ export const useUsersStore = defineStore('users', () => {
       const params = {
         page:      pagination.value.page,
         page_size: pagination.value.pageSize,
-        ...(filters.value.role       && { role:      filters.value.role }),
-        ...(filters.value.sector_id  && { sector_id: filters.value.sector_id }),
-        ...(filters.value.search     && { search:    filters.value.search }),
+        ...(filters.value.role      && { role:      filters.value.role }),
+        ...(filters.value.sector_id && { sector_id: filters.value.sector_id }),
+        ...(filters.value.search    && { search:    filters.value.search }),
       }
-      const data = await UsersService.getAll(params)
-      // Support both paginated { results, count } and plain array responses
-      if (Array.isArray(data)) {
-        users.value              = data
-        pagination.value.total   = data.length
-        pagination.value.totalPages = 1
-      } else {
-        users.value              = data.results ?? data.data ?? []
-        pagination.value.total   = data.count   ?? data.meta?.total ?? 0
-        pagination.value.totalPages =
-          Math.ceil(pagination.value.total / pagination.value.pageSize)
-      }
+      const res = await UsersService.getAll(params)
+      // Handle both standard paginated { data: [...], meta: {...} } and plain array
+      const list = res?.data ?? (Array.isArray(res) ? res : [])
+      const meta = res?.meta ?? {}
+      users.value                 = list
+      pagination.value.total      = meta.total      ?? list.length
+      pagination.value.totalPages = meta.total_pages ?? Math.ceil(list.length / pagination.value.pageSize)
     } catch (e) {
       error.value = e.message
     } finally {
@@ -75,23 +52,20 @@ export const useUsersStore = defineStore('users', () => {
     }
   }
 
-  /** Load reference data (roles + sectors) once at mount. */
   async function fetchReferenceData() {
     const [rolesData, sectorsData] = await Promise.all([
       UsersService.getRoles().catch(() => []),
       UsersService.getSectors().catch(() => []),
     ])
-    roles.value   = rolesData
-    sectors.value = sectorsData
+    roles.value   = Array.isArray(rolesData)   ? rolesData   : (rolesData?.data   ?? [])
+    sectors.value = Array.isArray(sectorsData) ? sectorsData : (sectorsData?.data ?? [])
   }
 
-  /** Invite (create) a new user. */
   async function inviteUser(formData) {
     loading.value = true
     error.value   = null
     try {
       const newUser = await UsersService.inviteUser(formData)
-      // Prepend to list so it's visible immediately
       users.value.unshift(newUser)
       pagination.value.total += 1
       closeModal()
@@ -104,7 +78,6 @@ export const useUsersStore = defineStore('users', () => {
     }
   }
 
-  /** Patch arbitrary fields on a user (name, phone, sector, manager…). */
   async function updateUser(userId, data) {
     loading.value = true
     error.value   = null
@@ -121,7 +94,6 @@ export const useUsersStore = defineStore('users', () => {
     }
   }
 
-  /** Change a user's role. */
   async function changeRole(userId, roleName) {
     loading.value = true
     error.value   = null
@@ -138,20 +110,17 @@ export const useUsersStore = defineStore('users', () => {
     }
   }
 
-  /** Toggle active / inactive. */
   async function toggleStatus(user) {
     const updated = await UsersService.setStatus(user.id, !user.is_active)
     _replaceInList(updated)
     return updated
   }
 
-  /** Soft-delete (deactivate) a user. */
   async function deactivateUser(userId) {
     loading.value = true
     error.value   = null
     try {
       await UsersService.deactivateUser(userId)
-      // Remove from visible list (or re-fetch to reflect server state)
       users.value = users.value.filter(u => u.id !== userId)
       pagination.value.total -= 1
       closeModal()
@@ -163,11 +132,9 @@ export const useUsersStore = defineStore('users', () => {
     }
   }
 
-  // ── Filter & pagination helpers ──────────────────────────────────
-
   function setFilter(key, value) {
-    filters.value[key] = value
-    pagination.value.page = 1   // reset to page 1 on filter change
+    filters.value[key]    = value
+    pagination.value.page = 1
     fetchUsers()
   }
 
@@ -182,8 +149,6 @@ export const useUsersStore = defineStore('users', () => {
     fetchUsers()
   }
 
-  // ── Modal helpers ────────────────────────────────────────────────
-
   function openModal(type, user = null) {
     modal.value = { type, user, open: true }
   }
@@ -192,19 +157,14 @@ export const useUsersStore = defineStore('users', () => {
     modal.value = { type: null, user: null, open: false }
   }
 
-  // ── Private ──────────────────────────────────────────────────────
-
   function _replaceInList(updated) {
     const idx = users.value.findIndex(u => u.id === updated.id)
     if (idx !== -1) users.value[idx] = updated
   }
 
   return {
-    // state
     users, roles, sectors, loading, error, pagination, filters, modal,
-    // getters
     activeFilters, rankOf,
-    // actions
     fetchUsers, fetchReferenceData,
     inviteUser, updateUser, changeRole, toggleStatus, deactivateUser,
     setFilter, resetFilters, setPage,

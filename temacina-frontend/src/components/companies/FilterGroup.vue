@@ -25,7 +25,7 @@
 
 <script setup>
 import { ref } from 'vue'
-import { ChevronDown } from 'lucide-vue-next'
+import { ChevronDown } from '@lucide/vue'
 
 defineProps({ label: String, badge: { type: Number, default: 0 } })
 const open = ref(true)

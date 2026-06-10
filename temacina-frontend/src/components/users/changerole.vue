@@ -80,7 +80,7 @@
 
 <script setup>
 import { ref, watch } from 'vue'
-import { ShieldCheck, X, AlertCircle } from 'lucide-vue-next'
+import { ShieldCheck, X, AlertCircle } from '@lucide/vue'
 import UserAvatar from './avatar.vue'
 import UserRoleBadge from './rolebadge.vue'
 
