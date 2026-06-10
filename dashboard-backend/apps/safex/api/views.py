@@ -4,9 +4,11 @@ from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
 
-from apps.safex.models import TradeShow, Company, Document, Sector
+from rest_framework import status
+from apps.safex.models import TradeShow, Company, Document, Sector, CompanyContact
 from apps.safex.api.serializers import (
     TradeShowSerializer, CompanyListSerializer, CompanyDetailSerializer,
+    CompanyWriteSerializer, ContactListSerializer,
     DocumentSerializer, SectorSerializer,
 )
 from apps.safex.api.filters import CompanyFilter, DocumentFilter
@@ -69,9 +71,14 @@ class CompanyListView(generics.ListAPIView):
     def get_queryset(self):
         return Company.objects.prefetch_related("sectors", "addresses")
 
-class CompanyDetailView(generics.RetrieveAPIView):
-    serializer_class = CompanyDetailSerializer
+class CompanyDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [IsAuthenticated]
+
+    def get_serializer_class(self):
+        if self.request.method in ("PATCH", "PUT"):
+            return CompanyWriteSerializer
+        return CompanyDetailSerializer
+
     def get_queryset(self):
         return (
             Company.objects
@@ -81,6 +88,45 @@ class CompanyDetailView(generics.RetrieveAPIView):
                 "contacts__phones__phone_type", "contacts__emails",
                 "documents__trade_show",
             )
+        )
+
+    def _require_admin(self, request):
+        role = getattr(request.user, "role", None)
+        role_name = role.name if hasattr(role, "name") else str(role or "")
+        if role_name not in ("admin", "superadmin"):
+            return Response(
+                {"detail": "Only admins can modify companies."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        return None
+
+    def update(self, request, *args, **kwargs):
+        err = self._require_admin(request)
+        if err:
+            return err
+        kwargs["partial"] = True
+        return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        err = self._require_admin(request)
+        if err:
+            return err
+        return super().destroy(request, *args, **kwargs)
+
+
+class ContactListView(generics.ListAPIView):
+    """All person contacts across all companies."""
+    serializer_class = ContactListSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [SearchFilter]
+    search_fields = ["first_name", "last_name", "role", "company__legal_name"]
+
+    def get_queryset(self):
+        return (
+            CompanyContact.objects
+            .select_related("company")
+            .prefetch_related("phones__phone_type", "emails")
+            .order_by("company__legal_name", "last_name")
         )
 
 class CompanyProfileCacheView(views.APIView):

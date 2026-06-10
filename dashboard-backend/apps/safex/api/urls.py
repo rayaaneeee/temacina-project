@@ -11,6 +11,9 @@ urlpatterns = [
     # ── Sectors ────────────────────────────────────────
     path("sectors/", views.SectorListView.as_view(), name="sector-list"),
 
+    # ── Contacts ──────────────────────────────────────
+    path("contacts/", views.ContactListView.as_view(), name="contact-list"),
+
     # ── Companies ──────────────────────────────────────
     path("companies/", views.CompanyListView.as_view(), name="company-list"),
     path("companies/<int:pk>/", views.CompanyDetailView.as_view(), name="company-detail"),

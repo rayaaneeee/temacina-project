@@ -203,11 +203,21 @@
                 {{ company.country ?? company.addresses?.[0]?.country ?? '—' }}
               </span>
 
-              <div class="w-16 flex justify-end">
+              <div class="w-16 flex justify-end items-center gap-1.5">
                 <button
                   @click.stop="store.selectCompany(company)"
                   class="text-xs text-orange-500 hover:text-orange-700 font-medium"
                 >View</button>
+                <template v-if="isAdmin">
+                  <button @click.stop="openEdit(company)" title="Edit"
+                    class="p-1 rounded hover:bg-orange-100 text-gray-400 hover:text-orange-500 transition-colors">
+                    <Pencil class="w-3.5 h-3.5" />
+                  </button>
+                  <button @click.stop="confirmDelete(company)" title="Delete"
+                    class="p-1 rounded hover:bg-red-50 text-gray-400 hover:text-red-500 transition-colors">
+                    <Trash2 class="w-3.5 h-3.5" />
+                  </button>
+                </template>
               </div>
             </div>
 
@@ -448,7 +458,7 @@
 
             </div>
 
-            <!-- Export selected -->
+            <!-- Panel actions -->
             <div class="px-4 pb-4 border-t border-gray-100 pt-3 flex gap-2">
               <button
                 @click="showExportModal = true"
@@ -458,11 +468,92 @@
                 <Download class="w-4 h-4" />
                 Export
               </button>
+              <template v-if="isAdmin">
+                <button @click="openEdit(store.selectedCompany)"
+                  class="px-3 py-2 rounded-lg border border-gray-200 text-gray-600 hover:border-orange-300 hover:text-orange-500 transition-colors" title="Edit">
+                  <Pencil class="w-4 h-4" />
+                </button>
+                <button @click="confirmDelete(store.selectedCompany)"
+                  class="px-3 py-2 rounded-lg border border-gray-200 text-gray-600 hover:border-red-300 hover:text-red-500 transition-colors" title="Delete">
+                  <Trash2 class="w-4 h-4" />
+                </button>
+              </template>
             </div>
           </template>
         </div>
       </div>
     </div>
+
+    <!-- ── Edit Modal ────────────────────────────────────────── -->
+    <Teleport to="body">
+      <Transition enter-from-class="opacity-0" enter-active-class="transition duration-150"
+        leave-to-class="opacity-0" leave-active-class="transition duration-150">
+        <div v-if="editTarget" class="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div class="absolute inset-0 bg-black/50 backdrop-blur-sm" @click="editTarget = null" />
+          <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-md z-10 overflow-hidden">
+            <div class="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+              <div class="flex items-center gap-3">
+                <div class="w-9 h-9 rounded-xl bg-orange-100 flex items-center justify-center">
+                  <Pencil class="w-4 h-4 text-orange-500" />
+                </div>
+                <p class="text-sm font-bold text-gray-800">Edit Company</p>
+              </div>
+              <button @click="editTarget = null" class="p-1.5 rounded-lg hover:bg-gray-100 text-gray-400">
+                <X class="w-4 h-4" />
+              </button>
+            </div>
+            <form @submit.prevent="submitEdit" class="p-5 space-y-4">
+              <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">Company Name <span class="text-red-500">*</span></label>
+                <input v-model="editForm.legal_name" required
+                  class="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-orange-400" />
+              </div>
+              <p v-if="editError" class="text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">{{ editError }}</p>
+              <div class="flex gap-3 pt-1">
+                <button type="submit" :disabled="editLoading"
+                  class="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl bg-orange-500 text-white text-sm font-semibold hover:bg-orange-600 transition-colors disabled:opacity-60">
+                  <div v-if="editLoading" class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                  Save Changes
+                </button>
+                <button type="button" @click="editTarget = null"
+                  class="px-4 py-2.5 rounded-xl border border-gray-200 text-sm text-gray-600 hover:bg-gray-50">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
+
+    <!-- ── Delete Confirm ─────────────────────────────────────── -->
+    <Teleport to="body">
+      <Transition enter-from-class="opacity-0" enter-active-class="transition duration-150"
+        leave-to-class="opacity-0" leave-active-class="transition duration-150">
+        <div v-if="deleteTarget" class="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div class="absolute inset-0 bg-black/50 backdrop-blur-sm" @click="deleteTarget = null" />
+          <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-sm z-10 p-6 text-center space-y-4">
+            <div class="w-12 h-12 bg-red-100 rounded-full flex items-center justify-center mx-auto">
+              <Trash2 class="w-5 h-5 text-red-500" />
+            </div>
+            <div>
+              <p class="text-sm font-bold text-gray-800">Delete company?</p>
+              <p class="text-xs text-gray-500 mt-1">
+                <span class="font-medium">{{ deleteTarget.legal_name }}</span> will be permanently removed along with all its data.
+              </p>
+            </div>
+            <div class="flex gap-3">
+              <button @click="doDelete"
+                class="flex-1 py-2.5 rounded-xl bg-red-500 text-white text-sm font-semibold hover:bg-red-600 transition-colors">
+                Delete
+              </button>
+              <button @click="deleteTarget = null"
+                class="flex-1 py-2.5 rounded-xl border border-gray-200 text-sm text-gray-600 hover:bg-gray-50">
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
 
     <!-- ── Export Modal ──────────────────────────────────────── -->
     <Teleport to="body">
@@ -532,19 +623,71 @@ import { RouterLink } from 'vue-router'
 import {
   Search, RotateCcw, Building2, Download,
   ExternalLink, Phone, Mail, Share2, FileText, Table2, X,
+  Pencil, Trash2,
 } from '@lucide/vue'
 import { useCompaniesStore } from '@/stores/companies'
+import { useAuthStore }      from '@/stores/auth'
 import FilterGroup    from '@/components/companies/FilterGroup.vue'
 import FilterCheckbox from '@/components/companies/FilterCheckbox.vue'
 import DetailRow      from '@/components/companies/DetailRow.vue'
 import SortableHeader from '@/components/companies/SortableHeader.vue'
+import api from '@/services/api'
 
-const store = useCompaniesStore()
+const store    = useCompaniesStore()
+const auth     = useAuthStore()
+const isAdmin  = computed(() => auth.hasRole('admin'))
 
 const showExportModal = ref(false)
 const detailLoading   = ref(false)
 
 const years = [2026, 2025, 2024, 2023, 2022]
+
+// ── Edit ──────────────────────────────────────────────────────
+const editTarget  = ref(null)
+const editForm    = ref({ legal_name: '' })
+const editLoading = ref(false)
+const editError   = ref('')
+
+function openEdit(company) {
+  editTarget.value = company
+  editForm.value   = { legal_name: company.legal_name }
+  editError.value  = ''
+}
+
+async function submitEdit() {
+  editLoading.value = true
+  editError.value   = ''
+  try {
+    await api.patch(`/companies/${editTarget.value.id}/`, editForm.value)
+    // update in-store
+    const c = store.companies.find(c => c.id === editTarget.value.id)
+    if (c) c.legal_name = editForm.value.legal_name
+    if (store.selectedCompany?.id === editTarget.value.id)
+      store.selectedCompany.legal_name = editForm.value.legal_name
+    editTarget.value = null
+  } catch (e) {
+    editError.value = e.message ?? 'Failed to update company'
+  } finally {
+    editLoading.value = false
+  }
+}
+
+// ── Delete ────────────────────────────────────────────────────
+const deleteTarget = ref(null)
+function confirmDelete(company) { deleteTarget.value = company }
+
+async function doDelete() {
+  const company = deleteTarget.value
+  deleteTarget.value = null
+  try {
+    await api.delete(`/companies/${company.id}/`)
+    store.companies = store.companies.filter(c => c.id !== company.id)
+    if (store.selectedCompany?.id === company.id) store.selectedCompany = null
+    store.pagination.total = Math.max(0, store.pagination.total - 1)
+  } catch (e) {
+    alert(e.message ?? 'Failed to delete company')
+  }
+}
 
 // Helper: resolve contact display name from list or detail shape
 function contactName(company) {

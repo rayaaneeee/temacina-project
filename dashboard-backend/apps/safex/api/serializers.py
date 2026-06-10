@@ -83,6 +83,23 @@ class CompanyDetailSerializer(serializers.ModelSerializer):
             for d in obj.documents.select_related("trade_show").all()
         })
 
+class CompanyWriteSerializer(serializers.ModelSerializer):
+    """Used for PATCH updates — only allows safe scalar fields."""
+    class Meta:
+        model  = Company
+        fields = ["legal_name", "logo"]
+
+class ContactListSerializer(serializers.ModelSerializer):
+    """Flat serializer for the /contacts/ list endpoint."""
+    phones       = PhoneSerializer(many=True, read_only=True)
+    emails       = EmailSerializer(many=True, read_only=True)
+    company_id   = serializers.IntegerField(source="company.id",         read_only=True)
+    company_name = serializers.CharField(source="company.legal_name",    read_only=True)
+    class Meta:
+        model  = CompanyContact
+        fields = ["id", "first_name", "last_name", "role",
+                  "phones", "emails", "company_id", "company_name"]
+
 class DocumentSerializer(serializers.ModelSerializer):
     trade_show = TradeShowSerializer(read_only=True)
     document_type = serializers.CharField(source="document_type.label", read_only=True)
