@@ -1,0 +1,3433 @@
+# ═══════════════════════════════════════════════════════════════════
+# Temacina Dashboard — User Management, Authentication & Security
+# ═══════════════════════════════════════════════════════════════════
+# Schema source  : users_and_roles.pdf
+# Prerequisite   : Safex data layer fully implemented (Parts 1–15)
+# Database       : Neon PostgreSQL (managed=False on all models)
+# Auth strategy  : JWT (access 15min + refresh 7d) + email reset flow
+# Security level : Production-hardened
+# ═══════════════════════════════════════════════════════════════════
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SCHEMA ANALYSIS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Tables from the PDF:
+  roles           → id, name
+  user_sectors    → id, name            (dashboard sectors, NOT Safex sectors)
+  users           → id, first_name, last_name, email, phone,
+                    password_hash, role_id, sector_id, manager_id,
+                    created_at
+  user_sessions   → id, user_id, login_at, logout_at, ip_address
+  user_clients    → id, user_id, company_id, assigned_at
+                    (company_id references Safex companies table)
+  audit_logs      → id, user_id, action_type, entity_type,
+                    entity_id, details (json), created_at
+
+Key relationships:
+  users.role_id    → roles.id         (many users → 1 role)
+  users.sector_id  → user_sectors.id  (many users → 1 user sector)
+  users.manager_id → users.id         (self-referential: user has a manager)
+  user_sessions.user_id  → users.id
+  user_clients.user_id   → users.id
+  user_clients.company_id → companies.id  (Safex data layer)
+  audit_logs.user_id → users.id
+
+Migration note:
+  All 6 tables use managed=False.
+  Run on Neon via their dashboard SQL editor BEFORE implementing models.
+  Django reads them — never creates or alters them.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 1 — APP RESTRUCTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The existing apps/users app is REPLACED by this new implementation.
+The existing apps/audit middleware is SUPERSEDED by the new audit_logs
+model which is richer and maps to the PDF schema.
+
+Final structure:
+
+  apps/
+  ├── users/                     ← REPLACE existing content entirely
+  │   ├── models.py              ← Role, UserSector, User, UserSession,
+  │   │                             UserClient  (all managed=False)
+  │   ├── managers.py            ← Custom UserManager
+  │   ├── permissions.py         ← DRF permission classes
+  │   ├── validators.py          ← Password strength, phone validation
+  │   ├── services/
+  │   │   ├── user.py            ← CRUD, role assignment, manager tree
+  │   │   ├── session.py         ← Login session tracking
+  │   │   └── client.py         ← Company assignment per user
+  │   ├── api/
+  │   │   ├── serializers.py
+  │   │   ├── views.py
+  │   │   ├── filters.py
+  │   │   └── urls.py
+  │   └── tests/
+  │       ├── factories.py
+  │       ├── test_models.py
+  │       ├── test_services.py
+  │       └── test_api.py
+  │
+  ├── authentication/            ← REPLACE existing content
+  │   ├── models.py              ← PasswordResetToken (managed=True)
+  │   ├── services.py            ← login, logout, reset flow
+  │   ├── email.py               ← email builder + Celery task
+  │   ├── throttles.py           ← custom login rate limiters
+  │   ├── backends.py            ← custom auth backend (email login)
+  │   ├── api/
+  │   │   ├── serializers.py
+  │   │   ├── views.py
+  │   │   └── urls.py
+  │   └── tests/
+  │       ├── test_services.py
+  │       └── test_api.py
+  │
+  └── audit/                     ← REPLACE middleware with model-based
+      ├── models.py              ← AuditLog (managed=False)
+      ├── services.py            ← write_log() helper
+      ├── middleware.py          ← lightweight request logger
+      └── admin.py
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 2 — SQL TO CREATE ON NEON FIRST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Run these in Neon's SQL editor before touching Django.
+password_reset_tokens is the only managed=True table (Django-owned).
+
+-- Reference tables
+CREATE TABLE roles (
+  id   SERIAL PRIMARY KEY,
+  name VARCHAR NOT NULL UNIQUE
+);
+INSERT INTO roles (name) VALUES
+  ('superadmin'), ('admin'), ('manager'), ('analyst'), ('viewer');
+
+CREATE TABLE user_sectors (
+  id   SERIAL PRIMARY KEY,
+  name VARCHAR NOT NULL UNIQUE
+);
+
+-- Core user table
+CREATE TABLE users (
+  id            SERIAL PRIMARY KEY,
+  first_name    VARCHAR NOT NULL,
+  last_name     VARCHAR NOT NULL,
+  email         VARCHAR NOT NULL UNIQUE,
+  phone         VARCHAR,
+  password_hash TEXT    NOT NULL,
+  role_id       INT     NOT NULL REFERENCES roles(id),
+  sector_id     INT     REFERENCES user_sectors(id),
+  manager_id    INT     REFERENCES users(id),
+  is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at    TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_users_email    ON users(email);
+CREATE INDEX idx_users_role_id  ON users(role_id);
+CREATE INDEX idx_users_manager  ON users(manager_id);
+
+-- Sessions
+CREATE TABLE user_sessions (
+  id         SERIAL PRIMARY KEY,
+  user_id    INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  login_at   TIMESTAMP NOT NULL DEFAULT NOW(),
+  logout_at  TIMESTAMP,
+  ip_address VARCHAR,
+  user_agent TEXT,
+  is_active  BOOLEAN NOT NULL DEFAULT TRUE
+);
+CREATE INDEX idx_sessions_user    ON user_sessions(user_id);
+CREATE INDEX idx_sessions_active  ON user_sessions(user_id, is_active);
+
+-- Company assignments
+CREATE TABLE user_clients (
+  id          SERIAL PRIMARY KEY,
+  user_id     INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  company_id  INT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  assigned_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  UNIQUE (user_id, company_id)
+);
+CREATE INDEX idx_clients_user    ON user_clients(user_id);
+CREATE INDEX idx_clients_company ON user_clients(company_id);
+
+-- Audit logs
+CREATE TABLE audit_logs (
+  id          SERIAL PRIMARY KEY,
+  user_id     INT REFERENCES users(id) ON DELETE SET NULL,
+  action_type VARCHAR NOT NULL,
+  entity_type VARCHAR NOT NULL,
+  entity_id   INT,
+  details     JSON,
+  ip_address  VARCHAR,
+  created_at  TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_audit_user    ON audit_logs(user_id);
+CREATE INDEX idx_audit_action  ON audit_logs(action_type);
+CREATE INDEX idx_audit_entity  ON audit_logs(entity_type, entity_id);
+CREATE INDEX idx_audit_created ON audit_logs(created_at);
+
+-- Password reset tokens (Django-managed via migration)
+-- Django will CREATE this table via migrate
+-- (see PART 6 for the model)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 3 — DJANGO MODELS  (apps/users/models.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# ── apps/users/models.py ─────────────────────────────────────────────
+
+from django.db import models
+from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
+from django.contrib.auth.hashers import make_password
+from apps.users.managers import UserManager
+
+
+class Role(models.Model):
+    class Names(models.TextChoices):
+        SUPERADMIN = "superadmin", "Super Admin"
+        ADMIN      = "admin",      "Admin"
+        MANAGER    = "manager",    "Manager"
+        ANALYST    = "analyst",    "Analyst"
+        VIEWER     = "viewer",     "Viewer"
+
+    name = models.CharField(max_length=50, unique=True,
+                            choices=Names.choices)
+
+    class Meta:
+        managed  = False
+        db_table = "roles"
+        ordering = ["id"]
+
+    def __str__(self):
+        return self.name
+
+    # Role hierarchy: higher index = more privileged
+    HIERARCHY = ["viewer", "analyst", "manager", "admin", "superadmin"]
+
+    def is_above(self, other_role_name: str) -> bool:
+        try:
+            return (self.HIERARCHY.index(self.name)
+                    > self.HIERARCHY.index(other_role_name))
+        except ValueError:
+            return False
+
+
+class UserSector(models.Model):
+    name = models.CharField(max_length=255, unique=True)
+
+    class Meta:
+        managed  = False
+        db_table = "user_sectors"
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class User(AbstractBaseUser, PermissionsMixin):
+    """
+    Maps to the `users` table. Uses AbstractBaseUser so Django's
+    password hashing ecosystem (check_password, set_password, hashers)
+    works against the password_hash column.
+    managed=False: table already exists on Neon.
+    """
+    first_name = models.CharField(max_length=255)
+    last_name  = models.CharField(max_length=255)
+    email      = models.EmailField(unique=True, db_index=True)
+    phone      = models.CharField(max_length=30, null=True, blank=True)
+
+    # Maps AbstractBaseUser's `password` field to `password_hash` column
+    password   = models.TextField(db_column="password_hash")
+
+    role       = models.ForeignKey(Role,       on_delete=models.PROTECT,
+                                   related_name="users")
+    sector     = models.ForeignKey(UserSector, on_delete=models.SET_NULL,
+                                   null=True, blank=True, related_name="users")
+    manager    = models.ForeignKey("self", on_delete=models.SET_NULL,
+                                   null=True, blank=True,
+                                   related_name="direct_reports")
+    is_active  = models.BooleanField(default=True)
+    is_staff   = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    USERNAME_FIELD  = "email"
+    REQUIRED_FIELDS = ["first_name", "last_name"]
+    objects = UserManager()
+
+    class Meta:
+        managed  = False
+        db_table = "users"
+        ordering = ["last_name", "first_name"]
+        indexes  = [
+            models.Index(fields=["email"]),
+            models.Index(fields=["role"]),
+            models.Index(fields=["manager"]),
+            models.Index(fields=["is_active"]),
+        ]
+
+    def __str__(self):
+        return f"{self.first_name} {self.last_name} <{self.email}>"
+
+    @property
+    def full_name(self):
+        return f"{self.first_name} {self.last_name}".strip()
+
+    @property
+    def role_name(self):
+        return self.role.name if self.role_id else None
+
+    def get_reportees(self):
+        """Recursively get all users in this manager's tree."""
+        direct = list(self.direct_reports.filter(is_active=True))
+        all_reports = list(direct)
+        for report in direct:
+            all_reports.extend(report.get_reportees())
+        return all_reports
+
+
+class UserSession(models.Model):
+    user       = models.ForeignKey(User, on_delete=models.CASCADE,
+                                   related_name="sessions")
+    login_at   = models.DateTimeField(auto_now_add=True)
+    logout_at  = models.DateTimeField(null=True, blank=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(blank=True)
+    is_active  = models.BooleanField(default=True)
+
+    class Meta:
+        managed  = False
+        db_table = "user_sessions"
+        ordering = ["-login_at"]
+        indexes  = [
+            models.Index(fields=["user", "is_active"]),
+            models.Index(fields=["login_at"]),
+        ]
+
+    def __str__(self):
+        return f"Session {self.user.email} @ {self.login_at}"
+
+
+class UserClient(models.Model):
+    """
+    Links a dashboard user to a Safex company they are allowed to see.
+    company_id references the Safex `companies` table (cross-app FK).
+    """
+    user        = models.ForeignKey(User, on_delete=models.CASCADE,
+                                    related_name="client_assignments")
+    company_id  = models.IntegerField(db_index=True)
+    assigned_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        managed  = False
+        db_table = "user_clients"
+        unique_together = [("user", "company_id")]
+        indexes = [
+            models.Index(fields=["user"]),
+            models.Index(fields=["company_id"]),
+        ]
+
+    def get_company(self):
+        from apps.safex.models import Company
+        try:
+            return Company.objects.get(id=self.company_id)
+        except Company.DoesNotExist:
+            return None
+
+
+# ── apps/audit/models.py ─────────────────────────────────────────────
+
+class AuditLog(models.Model):
+    class ActionType(models.TextChoices):
+        LOGIN           = "LOGIN",           "Login"
+        LOGOUT          = "LOGOUT",          "Logout"
+        LOGIN_FAILED    = "LOGIN_FAILED",    "Login Failed"
+        PASSWORD_RESET  = "PASSWORD_RESET",  "Password Reset"
+        USER_CREATED    = "USER_CREATED",    "User Created"
+        USER_UPDATED    = "USER_UPDATED",    "User Updated"
+        USER_DELETED    = "USER_DELETED",    "User Deleted"
+        ROLE_CHANGED    = "ROLE_CHANGED",    "Role Changed"
+        COMPANY_VIEWED  = "COMPANY_VIEWED",  "Company Viewed"
+        DATA_EXPORTED   = "DATA_EXPORTED",   "Data Exported"
+        ACCESS_DENIED   = "ACCESS_DENIED",   "Access Denied"
+
+    user        = models.ForeignKey(
+        "users.User", on_delete=models.SET_NULL,
+        null=True, related_name="audit_logs"
+    )
+    action_type = models.CharField(max_length=50, choices=ActionType.choices,
+                                   db_index=True)
+    entity_type = models.CharField(max_length=100, db_index=True)
+    entity_id   = models.IntegerField(null=True, blank=True)
+    details     = models.JSONField(null=True, blank=True)
+    ip_address  = models.GenericIPAddressField(null=True, blank=True)
+    created_at  = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        managed  = False
+        db_table = "audit_logs"
+        ordering = ["-created_at"]
+        indexes  = [
+            models.Index(fields=["user", "created_at"]),
+            models.Index(fields=["action_type", "created_at"]),
+            models.Index(fields=["entity_type", "entity_id"]),
+        ]
+
+    def __str__(self):
+        return f"{self.action_type} | {self.user} | {self.created_at}"
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 4 — USER MANAGER  (apps/users/managers.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+from django.contrib.auth.models import BaseUserManager
+
+
+class UserManager(BaseUserManager):
+
+    def create_user(self, email, password, first_name, last_name,
+                    role_id, **extra):
+        if not email:
+            raise ValueError("Email is required")
+        if not password:
+            raise ValueError("Password is required")
+        email = self.normalize_email(email)
+        user  = self.model(
+            email=email,
+            first_name=first_name,
+            last_name=last_name,
+            role_id=role_id,
+            **extra,
+        )
+        user.set_password(password)   # bcrypt via Django hashers
+        user.save(using=self._db)
+        return user
+
+    def create_superuser(self, email, password, first_name="Admin",
+                         last_name="User", **extra):
+        from apps.users.models import Role
+        admin_role = Role.objects.get(name=Role.Names.SUPERADMIN)
+        extra.setdefault("is_staff",     True)
+        extra.setdefault("is_superuser", True)
+        extra.setdefault("is_active",    True)
+        return self.create_user(
+            email=email, password=password,
+            first_name=first_name, last_name=last_name,
+            role_id=admin_role.id, **extra,
+        )
+
+    def active(self):
+        return self.filter(is_active=True)
+
+    def by_role(self, role_name: str):
+        return self.filter(role__name=role_name, is_active=True)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 5 — PASSWORD RESET TOKEN MODEL  (apps/authentication/models.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This is the ONLY managed=True model in the auth system.
+Django will CREATE this table via `python manage.py migrate`.
+
+import uuid
+import secrets
+from datetime import timedelta
+from django.db import models
+from django.utils import timezone
+
+
+class PasswordResetToken(models.Model):
+    """
+    Secure one-time password reset token.
+    - Token is a 64-char cryptographically random hex string.
+    - Expires after 1 hour.
+    - Invalidated immediately on use.
+    - Never stored in plain text — token_hash (SHA-256) is stored.
+    """
+    user       = models.ForeignKey(
+        "users.User", on_delete=models.CASCADE,
+        related_name="password_reset_tokens"
+    )
+    token_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    used_at    = models.DateTimeField(null=True, blank=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+
+    class Meta:
+        # managed=True — Django creates this table
+        db_table = "password_reset_tokens"
+        indexes  = [
+            models.Index(fields=["token_hash"]),
+            models.Index(fields=["user", "expires_at"]),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self.expires_at:
+            self.expires_at = timezone.now() + timedelta(hours=1)
+        super().save(*args, **kwargs)
+
+    @property
+    def is_valid(self):
+        return (
+            self.used_at   is None
+            and self.expires_at > timezone.now()
+        )
+
+    def mark_used(self):
+        self.used_at = timezone.now()
+        self.save(update_fields=["used_at"])
+
+    @classmethod
+    def generate(cls, user, ip_address=None):
+        """
+        Generates a new token, invalidates all previous tokens for this user,
+        stores only the SHA-256 hash, and returns the raw token string.
+        """
+        import hashlib
+        # Invalidate all previous tokens for this user
+        cls.objects.filter(user=user, used_at=None).update(
+            used_at=timezone.now()
+        )
+        raw_token = secrets.token_hex(32)  # 64-char hex, 256 bits of entropy
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        cls.objects.create(
+            user=user,
+            token_hash=token_hash,
+            ip_address=ip_address,
+        )
+        return raw_token  # only returned once, never stored
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 6 — PERMISSION CLASSES  (apps/users/permissions.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+from rest_framework.permissions import BasePermission
+
+HIERARCHY = ["viewer", "analyst", "manager", "admin", "superadmin"]
+
+
+def _rank(role_name: str) -> int:
+    try:
+        return HIERARCHY.index(role_name)
+    except ValueError:
+        return -1
+
+
+class IsSuperAdmin(BasePermission):
+    def has_permission(self, request, view):
+        return (request.user.is_authenticated
+                and request.user.role_name == "superadmin")
+
+
+class IsAdminOrAbove(BasePermission):
+    def has_permission(self, request, view):
+        return (request.user.is_authenticated
+                and _rank(request.user.role_name) >= _rank("admin"))
+
+
+class IsManagerOrAbove(BasePermission):
+    def has_permission(self, request, view):
+        return (request.user.is_authenticated
+                and _rank(request.user.role_name) >= _rank("manager"))
+
+
+class IsAnalystOrAbove(BasePermission):
+    def has_permission(self, request, view):
+        return (request.user.is_authenticated
+                and _rank(request.user.role_name) >= _rank("analyst"))
+
+
+class IsViewer(BasePermission):
+    def has_permission(self, request, view):
+        return request.user.is_authenticated
+
+
+class CanManageUser(BasePermission):
+    """
+    A manager can only edit/delete users they manage directly.
+    Admins and above can manage anyone below their level.
+    """
+    def has_object_permission(self, request, view, obj):
+        actor = request.user
+        if _rank(actor.role_name) >= _rank("admin"):
+            return _rank(actor.role_name) > _rank(obj.role_name)
+        if actor.role_name == "manager":
+            return obj.manager_id == actor.id
+        return False
+
+
+class CanAccessCompany(BasePermission):
+    """
+    Viewers and Analysts can only access companies assigned to them
+    via user_clients. Managers and above see all.
+    """
+    def has_permission(self, request, view):
+        return request.user.is_authenticated
+
+    def has_object_permission(self, request, view, obj):
+        user = request.user
+        if _rank(user.role_name) >= _rank("manager"):
+            return True
+        # obj is a Company; check user_clients
+        return user.client_assignments.filter(
+            company_id=obj.id
+        ).exists()
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 7 — PASSWORD VALIDATOR  (apps/users/validators.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+import re
+from django.core.exceptions import ValidationError
+
+
+class StrongPasswordValidator:
+    """
+    Enforces:
+      - Min 10 characters
+      - At least 1 uppercase letter
+      - At least 1 lowercase letter
+      - At least 1 digit
+      - At least 1 special character  (!@#$%^&*...)
+      - Not a common weak password
+    """
+    COMMON = {"password", "123456789", "azerty123", "admin1234",
+               "qwerty123", "letmein1", "welcome1"}
+
+    def validate(self, password, user=None):
+        if len(password) < 10:
+            raise ValidationError("Password must be at least 10 characters.")
+        if not re.search(r"[A-Z]", password):
+            raise ValidationError("Password must contain an uppercase letter.")
+        if not re.search(r"[a-z]", password):
+            raise ValidationError("Password must contain a lowercase letter.")
+        if not re.search(r"\d", password):
+            raise ValidationError("Password must contain a digit.")
+        if not re.search(r"[!@#$%^&*()\-_=+\[\]{}|;:,.<>?]", password):
+            raise ValidationError("Password must contain a special character.")
+        if password.lower() in self.COMMON:
+            raise ValidationError("Password is too common.")
+
+    def get_help_text(self):
+        return ("Password: 10+ chars, uppercase, lowercase, digit, "
+                "special character.")
+
+
+# Add to base.py AUTH_PASSWORD_VALIDATORS:
+AUTH_PASSWORD_VALIDATORS = [
+    {"NAME": "apps.users.validators.StrongPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 8 — BRUTE-FORCE PROTECTION  (apps/authentication/throttles.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+from rest_framework.throttling import AnonRateThrottle
+from django.core.cache import cache
+from rest_framework.exceptions import Throttled
+import hashlib
+
+
+class LoginRateThrottle(AnonRateThrottle):
+    """5 attempts per minute per IP."""
+    scope = "login"
+    rate  = "5/min"
+
+
+class PasswordResetThrottle(AnonRateThrottle):
+    """3 reset requests per hour per IP."""
+    scope = "password_reset"
+    rate  = "3/hour"
+
+
+class AccountLockoutMixin:
+    """
+    Locks an account for 15 minutes after 5 consecutive failed logins.
+    Key stored in Redis with TTL.
+    """
+    MAX_ATTEMPTS = 5
+    LOCKOUT_SEC  = 900   # 15 minutes
+
+    @staticmethod
+    def _key(email: str) -> str:
+        h = hashlib.md5(email.lower().encode()).hexdigest()
+        return f"login_attempts:{h}"
+
+    @classmethod
+    def is_locked(cls, email: str) -> bool:
+        val = cache.get(cls._key(email))
+        return val is not None and int(val) >= cls.MAX_ATTEMPTS
+
+    @classmethod
+    def record_failure(cls, email: str):
+        key  = cls._key(email)
+        curr = cache.get(key, 0)
+        cache.set(key, int(curr) + 1, timeout=cls.LOCKOUT_SEC)
+
+    @classmethod
+    def clear(cls, email: str):
+        cache.delete(cls._key(email))
+
+
+# Add to REST_FRAMEWORK in base.py:
+"DEFAULT_THROTTLE_CLASSES": [
+    "apps.authentication.throttles.LoginRateThrottle",
+    "rest_framework.throttling.UserRateThrottle",
+],
+"DEFAULT_THROTTLE_RATES": {
+    "login":          "5/min",
+    "password_reset": "3/hour",
+    "anon":           "100/hour",
+    "user":           "2000/hour",
+},
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 9 — AUTHENTICATION SERVICE  (apps/authentication/services.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+import hashlib
+import logging
+from django.contrib.auth import authenticate
+from django.utils import timezone
+from rest_framework_simplejwt.tokens import RefreshToken
+from apps.users.models import User, UserSession
+from apps.authentication.models import PasswordResetToken
+from apps.authentication.throttles import AccountLockoutMixin
+from apps.audit.services import write_log
+
+logger = logging.getLogger(__name__)
+
+
+class AuthService:
+
+    # ── LOGIN ─────────────────────────────────────────────────────
+    @staticmethod
+    def login(email: str, password: str, ip: str, user_agent: str) -> dict:
+        """
+        Full login flow:
+        1. Check account lockout
+        2. Authenticate credentials
+        3. On failure → record attempt, maybe lock account, log
+        4. On success → clear lockout, open session, issue JWT, log
+        """
+        if AccountLockoutMixin.is_locked(email):
+            raise PermissionError(
+                "Account temporarily locked due to too many failed attempts. "
+                "Try again in 15 minutes."
+            )
+
+        user = authenticate(username=email, password=password)
+
+        if not user:
+            AccountLockoutMixin.record_failure(email)
+            # Log even for unknown emails (do not leak user existence)
+            write_log(
+                user=None,
+                action="LOGIN_FAILED",
+                entity_type="User",
+                entity_id=None,
+                details={"email_attempted": email},
+                ip_address=ip,
+            )
+            raise ValueError("Invalid email or password.")
+
+        if not user.is_active:
+            raise PermissionError("Account is deactivated. Contact an admin.")
+
+        # Success path
+        AccountLockoutMixin.clear(email)
+
+        session = UserSession.objects.create(
+            user=user,
+            ip_address=ip,
+            user_agent=user_agent[:500] if user_agent else "",
+            is_active=True,
+        )
+        refresh = RefreshToken.for_user(user)
+        # Embed session id in token for traceability
+        refresh["session_id"] = session.id
+        refresh["role"]       = user.role_name
+
+        write_log(
+            user=user, action="LOGIN",
+            entity_type="UserSession",
+            entity_id=session.id,
+            details={"ip": ip},
+            ip_address=ip,
+        )
+        return {
+            "access":     str(refresh.access_token),
+            "refresh":    str(refresh),
+            "session_id": session.id,
+            "user": {
+                "id":        user.id,
+                "full_name": user.full_name,
+                "email":     user.email,
+                "role":      user.role_name,
+                "sector":    user.sector.name if user.sector else None,
+            },
+        }
+
+    # ── LOGOUT ────────────────────────────────────────────────────
+    @staticmethod
+    def logout(refresh_token_str: str, user, ip: str):
+        from rest_framework_simplejwt.tokens import RefreshToken
+        from rest_framework_simplejwt.exceptions import TokenError
+        try:
+            token      = RefreshToken(refresh_token_str)
+            session_id = token.get("session_id")
+            token.blacklist()
+            if session_id:
+                UserSession.objects.filter(id=session_id).update(
+                    logout_at=timezone.now(),
+                    is_active=False,
+                )
+            write_log(
+                user=user, action="LOGOUT",
+                entity_type="UserSession",
+                entity_id=session_id,
+                details=None, ip_address=ip,
+            )
+        except TokenError:
+            pass  # already blacklisted; ignore
+
+    # ── FORGOT PASSWORD ───────────────────────────────────────────
+    @staticmethod
+    def request_password_reset(email: str, ip: str) -> bool:
+        """
+        Always returns True regardless of whether email exists
+        to prevent user enumeration attacks.
+        Token generation and email dispatch are done asynchronously.
+        """
+        from apps.authentication.email import send_password_reset_email
+        try:
+            user = User.objects.get(email=email, is_active=True)
+            raw_token = PasswordResetToken.generate(user=user, ip_address=ip)
+            send_password_reset_email.delay(
+                user_id=user.id,
+                raw_token=raw_token,
+            )
+            write_log(
+                user=user, action="PASSWORD_RESET",
+                entity_type="PasswordResetToken",
+                entity_id=None,
+                details={"step": "requested", "ip": ip},
+                ip_address=ip,
+            )
+        except User.DoesNotExist:
+            # Deliberately do nothing — same response either way
+            logger.info("Password reset requested for unknown email: %s", email)
+        return True
+
+    # ── RESET PASSWORD ─────────────────────────────────────────────
+    @staticmethod
+    def reset_password(raw_token: str, new_password: str, ip: str) -> bool:
+        import hashlib
+        from django.contrib.auth.password_validation import validate_password
+
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+
+        try:
+            token_obj = PasswordResetToken.objects.select_related("user").get(
+                token_hash=token_hash
+            )
+        except PasswordResetToken.DoesNotExist:
+            raise ValueError("Invalid or expired reset link.")
+
+        if not token_obj.is_valid:
+            raise ValueError("Reset link has expired or already been used.")
+
+        validate_password(new_password, token_obj.user)  # runs validators
+        token_obj.user.set_password(new_password)
+        token_obj.user.save(update_fields=["password"])
+        token_obj.mark_used()
+
+        # Invalidate ALL existing sessions for this user (force re-login)
+        UserSession.objects.filter(
+            user=token_obj.user, is_active=True
+        ).update(logout_at=timezone.now(), is_active=False)
+
+        write_log(
+            user=token_obj.user, action="PASSWORD_RESET",
+            entity_type="User",
+            entity_id=token_obj.user.id,
+            details={"step": "completed", "ip": ip},
+            ip_address=ip,
+        )
+        return True
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 10 — EMAIL SERVICE  (apps/authentication/email.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Add to base.py:
+  EMAIL_BACKEND       = "django.core.mail.backends.smtp.EmailBackend"
+  EMAIL_HOST          = config("EMAIL_HOST")
+  EMAIL_PORT          = config("EMAIL_PORT", cast=int, default=587)
+  EMAIL_HOST_USER     = config("EMAIL_HOST_USER")
+  EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD")
+  EMAIL_USE_TLS       = True
+  DEFAULT_FROM_EMAIL  = config("DEFAULT_FROM_EMAIL")
+  FRONTEND_URL        = config("FRONTEND_URL")   # e.g. https://dashboard.temacina.com
+
+Add to .env:
+  EMAIL_HOST=smtp.sendgrid.net          # or smtp.gmail.com, mailgun, etc.
+  EMAIL_PORT=587
+  EMAIL_HOST_USER=apikey
+  EMAIL_HOST_PASSWORD=your_smtp_password
+  DEFAULT_FROM_EMAIL=noreply@temacina.com
+  FRONTEND_URL=https://dashboard.temacina.com
+
+
+# ── apps/authentication/email.py ─────────────────────────────────────
+
+from celery import shared_task
+from django.core.mail import send_mail
+from django.conf import settings
+from django.template.loader import render_to_string
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def send_password_reset_email(self, user_id: int, raw_token: str):
+    """
+    Celery task: sends the password reset email asynchronously.
+    Retries up to 3 times on SMTP failure.
+    """
+    from apps.users.models import User
+    try:
+        user      = User.objects.get(id=user_id)
+        reset_url = (
+            f"{settings.FRONTEND_URL}/reset-password"
+            f"?token={raw_token}"
+        )
+        # Plain-text body
+        message = (
+            f"Hello {user.first_name},\n\n"
+            f"You requested a password reset for your Temacina account.\n\n"
+            f"Click the link below to set a new password (valid for 1 hour):\n"
+            f"{reset_url}\n\n"
+            f"If you did not request this, please ignore this email.\n"
+            f"Your password will remain unchanged.\n\n"
+            f"— The Temacina Team"
+        )
+        send_mail(
+            subject="Reset your Temacina password",
+            message=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[user.email],
+            fail_silently=False,
+        )
+        logger.info("Password reset email sent to %s", user.email)
+    except Exception as exc:
+        logger.exception("Failed to send reset email to user %s", user_id)
+        raise self.retry(exc=exc)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 11 — AUDIT SERVICE  (apps/audit/services.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+from apps.audit.models import AuditLog
+
+
+def write_log(
+    user,
+    action: str,
+    entity_type: str,
+    entity_id=None,
+    details=None,
+    ip_address=None,
+):
+    """
+    Central helper called throughout the codebase to write audit entries.
+    Always non-blocking — errors are silently logged, never raised.
+    """
+    import logging
+    logger = logging.getLogger("audit")
+    try:
+        AuditLog.objects.create(
+            user=user,
+            action_type=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            details=details,
+            ip_address=ip_address,
+        )
+    except Exception:
+        logger.exception(
+            "Audit write failed: action=%s entity=%s/%s",
+            action, entity_type, entity_id
+        )
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 12 — USER MANAGEMENT SERVICE  (apps/users/services/user.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+from django.core.cache import cache
+from apps.users.models import User, Role, UserSector, UserClient
+from apps.audit.services import write_log
+
+
+class UserService:
+
+    CACHE_TTL = 300
+
+    @staticmethod
+    def get_all(filters=None) -> "QuerySet":
+        qs = (
+            User.objects
+            .select_related("role", "sector", "manager")
+            .filter(is_active=True)
+        )
+        if filters:
+            if filters.get("role"):
+                qs = qs.filter(role__name=filters["role"])
+            if filters.get("sector_id"):
+                qs = qs.filter(sector_id=filters["sector_id"])
+            if filters.get("manager_id"):
+                qs = qs.filter(manager_id=filters["manager_id"])
+        return qs
+
+    @staticmethod
+    def get_by_id(user_id: int) -> "User | None":
+        key    = f"user:profile:{user_id}"
+        cached = cache.get(key)
+        if cached:
+            return cached
+        try:
+            user = (User.objects
+                    .select_related("role", "sector", "manager")
+                    .get(id=user_id, is_active=True))
+            cache.set(key, user, UserService.CACHE_TTL)
+            return user
+        except User.DoesNotExist:
+            return None
+
+    @staticmethod
+    def create_user(actor, data: dict) -> "User":
+        """
+        Actor must be admin or above and cannot create users
+        with higher or equal privilege.
+        """
+        target_role = Role.objects.get(id=data["role_id"])
+        if not actor.role.is_above(target_role.name):
+            raise PermissionError(
+                "You cannot create a user with a role equal "
+                "to or higher than yours."
+            )
+        password = data.pop("password")
+        user = User.objects.create_user(password=password, **data)
+        write_log(
+            user=actor, action="USER_CREATED",
+            entity_type="User", entity_id=user.id,
+            details={"email": user.email, "role": target_role.name},
+        )
+        return user
+
+    @staticmethod
+    def update_user(actor, target: "User", data: dict) -> "User":
+        safe_fields = {"first_name", "last_name", "phone",
+                       "sector_id", "manager_id"}
+        if actor.role.name in ("admin", "superadmin"):
+            safe_fields.add("role_id")
+            safe_fields.add("is_active")
+        for field, value in data.items():
+            if field in safe_fields:
+                setattr(target, field, value)
+        target.save()
+        cache.delete(f"user:profile:{target.id}")
+        write_log(
+            user=actor, action="USER_UPDATED",
+            entity_type="User", entity_id=target.id,
+            details={"changed_fields": list(data.keys())},
+        )
+        return target
+
+    @staticmethod
+    def deactivate_user(actor, target: "User"):
+        if not actor.role.is_above(target.role_name):
+            raise PermissionError("Insufficient privilege to deactivate this user.")
+        target.is_active = False
+        target.save(update_fields=["is_active"])
+        cache.delete(f"user:profile:{target.id}")
+        write_log(
+            user=actor, action="USER_DELETED",
+            entity_type="User", entity_id=target.id,
+            details={"email": target.email},
+        )
+
+    @staticmethod
+    def change_role(actor, target: "User", new_role_name: str):
+        if not actor.role.is_above(new_role_name):
+            raise PermissionError("Cannot assign a role equal to or above your own.")
+        new_role = Role.objects.get(name=new_role_name)
+        old_role = target.role_name
+        target.role = new_role
+        target.save(update_fields=["role_id"])
+        cache.delete(f"user:profile:{target.id}")
+        write_log(
+            user=actor, action="ROLE_CHANGED",
+            entity_type="User", entity_id=target.id,
+            details={"from": old_role, "to": new_role_name},
+        )
+
+    @staticmethod
+    def assign_company(user: "User", company_id: int, actor):
+        obj, created = UserClient.objects.get_or_create(
+            user=user, company_id=company_id
+        )
+        if not created:
+            raise ValueError("Company already assigned to this user.")
+        write_log(
+            user=actor, action="COMPANY_VIEWED",
+            entity_type="UserClient", entity_id=obj.id,
+            details={"company_id": company_id, "assigned_to": user.id},
+        )
+        return obj
+
+    @staticmethod
+    def get_direct_reports(manager_id: int):
+        return (
+            User.objects
+            .filter(manager_id=manager_id, is_active=True)
+            .select_related("role", "sector")
+        )
+
+    @staticmethod
+    def get_assigned_companies(user: "User"):
+        from apps.safex.models import Company
+        company_ids = user.client_assignments.values_list("company_id", flat=True)
+        return Company.objects.filter(id__in=company_ids)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 13 — SERIALIZERS  (apps/users/api/serializers.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+from rest_framework import serializers
+from django.contrib.auth.password_validation import validate_password
+from apps.users.models import User, Role, UserSector, UserSession, UserClient
+
+
+class RoleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model  = Role
+        fields = ["id", "name"]
+
+
+class UserSectorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model  = UserSector
+        fields = ["id", "name"]
+
+
+class UserListSerializer(serializers.ModelSerializer):
+    role    = RoleSerializer(read_only=True)
+    sector  = UserSectorSerializer(read_only=True)
+    manager = serializers.SerializerMethodField()
+
+    class Meta:
+        model  = User
+        fields = ["id", "first_name", "last_name", "email",
+                  "phone", "role", "sector", "manager",
+                  "is_active", "created_at"]
+
+    def get_manager(self, obj):
+        if obj.manager:
+            return {"id": obj.manager.id, "full_name": obj.manager.full_name}
+        return None
+
+
+class UserDetailSerializer(UserListSerializer):
+    direct_reports = serializers.SerializerMethodField()
+
+    class Meta(UserListSerializer.Meta):
+        fields = UserListSerializer.Meta.fields + ["direct_reports"]
+
+    def get_direct_reports(self, obj):
+        return [{"id": r.id, "full_name": r.full_name, "email": r.email}
+                for r in obj.direct_reports.filter(is_active=True)]
+
+
+class UserCreateSerializer(serializers.Serializer):
+    first_name = serializers.CharField(max_length=255)
+    last_name  = serializers.CharField(max_length=255)
+    email      = serializers.EmailField()
+    phone      = serializers.CharField(max_length=30, required=False)
+    password   = serializers.CharField(write_only=True, min_length=10)
+    role_id    = serializers.IntegerField()
+    sector_id  = serializers.IntegerField(required=False, allow_null=True)
+    manager_id = serializers.IntegerField(required=False, allow_null=True)
+
+    def validate_password(self, value):
+        validate_password(value)
+        return value
+
+    def validate_email(self, value):
+        if User.objects.filter(email=value).exists():
+            raise serializers.ValidationError("Email already registered.")
+        return value.lower()
+
+
+class UserUpdateSerializer(serializers.Serializer):
+    first_name = serializers.CharField(max_length=255, required=False)
+    last_name  = serializers.CharField(max_length=255, required=False)
+    phone      = serializers.CharField(max_length=30,  required=False,
+                                       allow_null=True)
+    sector_id  = serializers.IntegerField(required=False, allow_null=True)
+    manager_id = serializers.IntegerField(required=False, allow_null=True)
+    role_id    = serializers.IntegerField(required=False)  # admin only
+    is_active  = serializers.BooleanField(required=False)  # admin only
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    old_password = serializers.CharField(write_only=True)
+    new_password = serializers.CharField(write_only=True, min_length=10)
+
+    def validate_new_password(self, value):
+        validate_password(value)
+        return value
+
+
+class UserSessionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model  = UserSession
+        fields = ["id", "login_at", "logout_at", "ip_address", "is_active"]
+
+
+# ── apps/authentication/api/serializers.py ───────────────────────────
+
+class LoginSerializer(serializers.Serializer):
+    email    = serializers.EmailField()
+    password = serializers.CharField(write_only=True)
+
+
+class PasswordResetRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+
+class PasswordResetConfirmSerializer(serializers.Serializer):
+    token        = serializers.CharField()
+    new_password = serializers.CharField(write_only=True, min_length=10)
+
+    def validate_new_password(self, value):
+        validate_password(value)
+        return value
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 14 — API VIEWS  (apps/users/api/views.py & authentication/api/views.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# ── apps/authentication/api/views.py ─────────────────────────────────
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status, permissions
+from rest_framework_simplejwt.views import TokenRefreshView
+from apps.authentication.services import AuthService
+from apps.authentication.throttles import LoginRateThrottle, PasswordResetThrottle
+from apps.authentication.api.serializers import (
+    LoginSerializer,
+    PasswordResetRequestSerializer,
+    PasswordResetConfirmSerializer,
+)
+
+
+class LoginView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_classes   = [LoginRateThrottle]
+
+    def post(self, request):
+        s = LoginSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        ip         = _get_ip(request)
+        user_agent = request.META.get("HTTP_USER_AGENT", "")
+        try:
+            tokens = AuthService.login(
+                email=s.validated_data["email"],
+                password=s.validated_data["password"],
+                ip=ip,
+                user_agent=user_agent,
+            )
+        except PermissionError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_403_FORBIDDEN)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_401_UNAUTHORIZED)
+        return Response(tokens)
+
+
+class LogoutView(APIView):
+    def post(self, request):
+        refresh = request.data.get("refresh")
+        if not refresh:
+            return Response({"detail": "Refresh token required."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        AuthService.logout(refresh, request.user, _get_ip(request))
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class PasswordResetRequestView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_classes   = [PasswordResetThrottle]
+
+    def post(self, request):
+        s = PasswordResetRequestSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        AuthService.request_password_reset(
+            email=s.validated_data["email"],
+            ip=_get_ip(request),
+        )
+        # Always return 200 — never reveal whether email exists
+        return Response({
+            "detail": "If this email is registered, a reset link has been sent."
+        })
+
+
+class PasswordResetConfirmView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        s = PasswordResetConfirmSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        try:
+            AuthService.reset_password(
+                raw_token=s.validated_data["token"],
+                new_password=s.validated_data["new_password"],
+                ip=_get_ip(request),
+            )
+        except ValueError as e:
+            return Response({"detail": str(e)},
+                            status=status.HTTP_400_BAD_REQUEST)
+        return Response({"detail": "Password reset successful. Please log in."})
+
+
+class ChangePasswordView(APIView):
+    def post(self, request):
+        from apps.users.api.serializers import ChangePasswordSerializer
+        s = ChangePasswordSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        user = request.user
+        if not user.check_password(s.validated_data["old_password"]):
+            return Response({"detail": "Current password is incorrect."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        user.set_password(s.validated_data["new_password"])
+        user.save(update_fields=["password"])
+        # Invalidate all sessions except current
+        from apps.audit.services import write_log
+        write_log(user=user, action="PASSWORD_RESET",
+                  entity_type="User", entity_id=user.id,
+                  details={"step": "self_change"}, ip_address=_get_ip(request))
+        return Response({"detail": "Password changed successfully."})
+
+
+def _get_ip(request):
+    xff = request.META.get("HTTP_X_FORWARDED_FOR")
+    return xff.split(",")[0].strip() if xff else request.META.get("REMOTE_ADDR")
+
+
+# ── apps/users/api/views.py ──────────────────────────────────────────
+
+from rest_framework import generics, views, status
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from apps.users.models import User, Role, UserSector, UserSession
+from apps.users.permissions import (
+    IsAdminOrAbove, IsManagerOrAbove, IsSuperAdmin, CanManageUser
+)
+from apps.users.api.serializers import (
+    UserListSerializer, UserDetailSerializer,
+    UserCreateSerializer, UserUpdateSerializer,
+    RoleSerializer, UserSectorSerializer, UserSessionSerializer,
+)
+from apps.users.services.user import UserService
+from apps.audit.services import write_log
+
+
+class MeView(views.APIView):
+    def get(self, request):
+        serializer = UserDetailSerializer(request.user)
+        return Response(serializer.data)
+
+    def patch(self, request):
+        s = UserUpdateSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        # Self-update: only non-privileged fields
+        allowed = {"first_name", "last_name", "phone"}
+        data    = {k: v for k, v in s.validated_data.items() if k in allowed}
+        user    = UserService.update_user(request.user, request.user, data)
+        return Response(UserDetailSerializer(user).data)
+
+
+class UserListCreateView(views.APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def get(self, request):
+        filters = {
+            "role":       request.query_params.get("role"),
+            "sector_id":  request.query_params.get("sector_id"),
+            "manager_id": request.query_params.get("manager_id"),
+        }
+        users = UserService.get_all({k: v for k, v in filters.items() if v})
+        serializer = UserListSerializer(users, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        s = UserCreateSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        try:
+            user = UserService.create_user(request.user, s.validated_data)
+        except PermissionError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_403_FORBIDDEN)
+        return Response(UserDetailSerializer(user).data,
+                        status=status.HTTP_201_CREATED)
+
+
+class UserDetailView(views.APIView):
+    permission_classes = [IsManagerOrAbove]
+
+    def get(self, request, pk):
+        user = UserService.get_by_id(pk)
+        if not user:
+            return Response({"detail": "Not found."}, status=404)
+        return Response(UserDetailSerializer(user).data)
+
+    def patch(self, request, pk):
+        target = UserService.get_by_id(pk)
+        if not target:
+            return Response({"detail": "Not found."}, status=404)
+        s = UserUpdateSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        try:
+            user = UserService.update_user(request.user, target, s.validated_data)
+        except PermissionError as e:
+            return Response({"detail": str(e)}, status=403)
+        return Response(UserDetailSerializer(user).data)
+
+    def delete(self, request, pk):
+        target = UserService.get_by_id(pk)
+        if not target:
+            return Response({"detail": "Not found."}, status=404)
+        try:
+            UserService.deactivate_user(request.user, target)
+        except PermissionError as e:
+            return Response({"detail": str(e)}, status=403)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ChangeRoleView(views.APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def post(self, request, pk):
+        target   = UserService.get_by_id(pk)
+        new_role = request.data.get("role")
+        if not target or not new_role:
+            return Response({"detail": "Invalid request."}, status=400)
+        try:
+            UserService.change_role(request.user, target, new_role)
+        except (PermissionError, Role.DoesNotExist) as e:
+            return Response({"detail": str(e)}, status=403)
+        return Response({"detail": f"Role changed to {new_role}."})
+
+
+class AssignCompanyView(views.APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def post(self, request, pk):
+        target     = UserService.get_by_id(pk)
+        company_id = request.data.get("company_id")
+        if not target or not company_id:
+            return Response({"detail": "Invalid request."}, status=400)
+        try:
+            obj = UserService.assign_company(target, int(company_id), request.user)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=400)
+        return Response({"detail": "Company assigned.", "id": obj.id},
+                        status=201)
+
+
+class UserAssignedCompaniesView(views.APIView):
+    def get(self, request, pk):
+        from apps.safex.api.serializers import CompanyListSerializer
+        target    = UserService.get_by_id(pk)
+        if not target:
+            return Response({"detail": "Not found."}, status=404)
+        companies = UserService.get_assigned_companies(target)
+        write_log(
+            user=request.user, action="COMPANY_VIEWED",
+            entity_type="User", entity_id=target.id, details=None,
+        )
+        return Response(CompanyListSerializer(companies, many=True).data)
+
+
+class DirectReportsView(views.APIView):
+    permission_classes = [IsManagerOrAbove]
+
+    def get(self, request, pk):
+        reports = UserService.get_direct_reports(pk)
+        return Response(UserListSerializer(reports, many=True).data)
+
+
+class UserSessionsView(views.APIView):
+    permission_classes = [IsAdminOrAbove]
+
+    def get(self, request, pk):
+        sessions = UserSession.objects.filter(
+            user_id=pk
+        ).order_by("-login_at")[:50]
+        return Response(UserSessionSerializer(sessions, many=True).data)
+
+
+class RoleListView(generics.ListAPIView):
+    queryset           = Role.objects.all()
+    serializer_class   = RoleSerializer
+    permission_classes = [IsAdminOrAbove]
+
+
+class UserSectorListView(generics.ListAPIView):
+    queryset           = UserSector.objects.all()
+    serializer_class   = UserSectorSerializer
+    permission_classes = [IsAuthenticated]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 15 — URL CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# ── apps/authentication/api/urls.py ──────────────────────────────────
+
+from django.urls import path
+from rest_framework_simplejwt.views import TokenRefreshView
+from . import views
+
+urlpatterns = [
+    # POST  /api/v1/auth/login/
+    path("login/",            views.LoginView.as_view(),               name="auth-login"),
+    # POST  /api/v1/auth/logout/
+    path("logout/",           views.LogoutView.as_view(),              name="auth-logout"),
+    # POST  /api/v1/auth/refresh/
+    path("refresh/",          TokenRefreshView.as_view(),              name="auth-refresh"),
+    # POST  /api/v1/auth/password/change/
+    path("password/change/",  views.ChangePasswordView.as_view(),      name="auth-change-password"),
+    # POST  /api/v1/auth/password/reset/
+    path("password/reset/",   views.PasswordResetRequestView.as_view(),name="auth-reset-request"),
+    # POST  /api/v1/auth/password/reset/confirm/
+    path("password/reset/confirm/", views.PasswordResetConfirmView.as_view(),
+         name="auth-reset-confirm"),
+]
+
+
+# ── apps/users/api/urls.py ───────────────────────────────────────────
+
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    # GET       /api/v1/users/me/                   own profile
+    # PATCH     /api/v1/users/me/                   update own profile
+    path("me/",                       views.MeView.as_view(),                name="user-me"),
+
+    # GET       /api/v1/users/                      list users (admin+)
+    # POST      /api/v1/users/                      create user (admin+)
+    path("",                          views.UserListCreateView.as_view(),     name="user-list"),
+
+    # GET       /api/v1/users/roles/                list all roles
+    path("roles/",                    views.RoleListView.as_view(),           name="role-list"),
+
+    # GET       /api/v1/users/sectors/              list all user sectors
+    path("sectors/",                  views.UserSectorListView.as_view(),     name="user-sector-list"),
+
+    # GET       /api/v1/users/{id}/                 user detail (manager+)
+    # PATCH     /api/v1/users/{id}/                 update user
+    # DELETE    /api/v1/users/{id}/                 deactivate user
+    path("<int:pk>/",                 views.UserDetailView.as_view(),         name="user-detail"),
+
+    # POST      /api/v1/users/{id}/role/            change role
+    path("<int:pk>/role/",            views.ChangeRoleView.as_view(),         name="user-change-role"),
+
+    # GET       /api/v1/users/{id}/reports/         direct reports
+    path("<int:pk>/reports/",         views.DirectReportsView.as_view(),      name="user-reports"),
+
+    # GET       /api/v1/users/{id}/sessions/        login history
+    path("<int:pk>/sessions/",        views.UserSessionsView.as_view(),       name="user-sessions"),
+
+    # POST      /api/v1/users/{id}/companies/       assign company
+    # GET       /api/v1/users/{id}/companies/       list assigned companies
+    path("<int:pk>/companies/",       views.UserAssignedCompaniesView.as_view(),
+         name="user-companies"),
+    path("<int:pk>/companies/assign/",views.AssignCompanyView.as_view(),
+         name="user-assign-company"),
+]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 16 — COMPLETE ENDPOINT REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+METHOD  ENDPOINT                                 ROLE REQUIRED   DESCRIPTION
+────────────────────────────────────────────────────────────────────────────────
+# Authentication
+POST    /api/v1/auth/login/                      Public          Login → JWT tokens
+POST    /api/v1/auth/logout/                     Any             Blacklist token, close session
+POST    /api/v1/auth/refresh/                    Public          Refresh access token
+POST    /api/v1/auth/password/change/            Any             Change own password
+POST    /api/v1/auth/password/reset/             Public          Request reset email
+POST    /api/v1/auth/password/reset/confirm/     Public          Confirm reset with token
+
+# Own Profile
+GET     /api/v1/users/me/                        Any             Own profile + direct reports
+PATCH   /api/v1/users/me/                        Any             Update own name/phone
+
+# User Management
+GET     /api/v1/users/                           Admin+          List users (filterable)
+POST    /api/v1/users/                           Admin+          Create new user
+GET     /api/v1/users/{id}/                      Manager+        User detail
+PATCH   /api/v1/users/{id}/                      Admin+          Update user fields
+DELETE  /api/v1/users/{id}/                      Admin+          Deactivate user (soft delete)
+POST    /api/v1/users/{id}/role/                 Admin+          Change user role
+GET     /api/v1/users/{id}/reports/              Manager+        Direct reports of user
+GET     /api/v1/users/{id}/sessions/             Admin+          Login session history
+GET     /api/v1/users/{id}/companies/            Manager+        Assigned companies
+POST    /api/v1/users/{id}/companies/assign/     Admin+          Assign company to user
+
+# Reference Data
+GET     /api/v1/users/roles/                     Admin+          List all roles
+GET     /api/v1/users/sectors/                   Any             List all user sectors
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 17 — SECURITY ENHANCEMENTS (NEW + RETROACTIVE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+These improvements apply to the ENTIRE backend (all previous work).
+
+────────────────────────────────────────────────────────────────────
+17.1 — DJANGO SETTINGS HARDENING (config/settings/production.py)
+────────────────────────────────────────────────────────────────────
+
+# Content Security Policy (prevents XSS in admin / swagger)
+pip install django-csp
+
+MIDDLEWARE += ["csp.middleware.CSPMiddleware"]
+CSP_DEFAULT_SRC  = ("'self'",)
+CSP_SCRIPT_SRC   = ("'self'",)
+CSP_STYLE_SRC    = ("'self'",)
+CSP_IMG_SRC      = ("'self'", "data:")
+CSP_CONNECT_SRC  = ("'self'",)
+
+# Referrer policy
+SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+
+# Permissions policy (disables browser APIs that aren't needed)
+PERMISSIONS_POLICY = {
+    "geolocation": [],
+    "microphone":  [],
+    "camera":      [],
+}
+
+# Session hardening
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Strict"
+CSRF_COOKIE_SAMESITE    = "Strict"
+
+# Force HTTPS-only cookies
+SESSION_COOKIE_SECURE = True
+CSRF_COOKIE_SECURE    = True
+
+# Cookie expiry
+SESSION_COOKIE_AGE = 3600  # 1 hour idle timeout
+
+
+────────────────────────────────────────────────────────────────────
+17.2 — NEON DATABASE SECURITY
+────────────────────────────────────────────────────────────────────
+
+In base.py DATABASES["default"]["OPTIONS"]:
+  "sslmode": "require",
+  "options": "-c statement_timeout=30000 -c lock_timeout=10000",
+
+# statement_timeout=30s  → kills runaway queries automatically
+# lock_timeout=10s       → prevents deadlocks from locking the API
+
+In Neon dashboard:
+  - Create a READ-ONLY role for analytics queries
+  - Create a READ-WRITE role for the API
+  - Never use the superuser role in application config
+  - Enable Neon's IP allowlist to only permit your server IPs
+
+
+────────────────────────────────────────────────────────────────────
+17.3 — REDIS SECURITY
+────────────────────────────────────────────────────────────────────
+
+In docker-compose.yml redis service:
+  command: >
+    redis-server
+    --requirepass ${REDIS_PASSWORD}
+    --maxmemory 512mb
+    --maxmemory-policy allkeys-lru
+    --bind 127.0.0.1
+    --protected-mode yes
+
+In .env:
+  REDIS_PASSWORD=your_strong_redis_password
+
+In base.py CACHES["default"]["OPTIONS"]:
+  "PASSWORD": config("REDIS_PASSWORD"),
+
+Never expose Redis port 6379 publicly. Bind to 127.0.0.1 only.
+
+
+────────────────────────────────────────────────────────────────────
+17.4 — JWT TOKEN HARDENING (base.py)
+────────────────────────────────────────────────────────────────────
+
+from datetime import timedelta
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME":      timedelta(minutes=15),  # short-lived
+    "REFRESH_TOKEN_LIFETIME":     timedelta(days=7),
+    "ROTATE_REFRESH_TOKENS":      True,                   # new refresh on each use
+    "BLACKLIST_AFTER_ROTATION":   True,                   # old refresh unusable
+    "UPDATE_LAST_LOGIN":          True,
+    "ALGORITHM":                  "HS256",
+    "SIGNING_KEY":                config("SECRET_KEY"),
+    "AUTH_HEADER_TYPES":          ("Bearer",),
+    "AUTH_TOKEN_CLASSES":         ("rest_framework_simplejwt.tokens.AccessToken",),
+    # Embed role in token to avoid DB hit per request
+    "TOKEN_OBTAIN_SERIALIZER": "rest_framework_simplejwt.serializers.TokenObtainPairSerializer",
+    "TOKEN_REFRESH_SERIALIZER":"rest_framework_simplejwt.serializers.TokenRefreshSerializer",
+}
+
+SECRET_KEY must be:
+  - At least 50 random characters
+  - Generated with: python -c "import secrets; print(secrets.token_hex(32))"
+  - Rotated if ever exposed
+  - Different across environments (dev / prod)
+
+
+────────────────────────────────────────────────────────────────────
+17.5 — RATE LIMITING PER ENDPOINT (base.py)
+────────────────────────────────────────────────────────────────────
+
+"DEFAULT_THROTTLE_RATES": {
+    "login":          "5/min",     # 5 login attempts per minute per IP
+    "password_reset": "3/hour",    # 3 reset requests per hour per IP
+    "anon":           "100/hour",  # general unauthenticated limit
+    "user":           "2000/hour", # general authenticated limit
+    "export":         "10/hour",   # for report/export endpoints
+},
+
+
+────────────────────────────────────────────────────────────────────
+17.6 — INPUT SANITIZATION (core/validators.py)
+────────────────────────────────────────────────────────────────────
+
+Add to core/validators.py:
+
+import re
+from rest_framework import serializers
+
+
+def no_html(value: str) -> str:
+    """Strip all HTML/script tags from string inputs."""
+    if re.search(r"<[^>]+>", value):
+        raise serializers.ValidationError(
+            "HTML tags are not allowed in this field."
+        )
+    return value
+
+
+def safe_integer(value) -> int:
+    """Validate that query param IDs are safe integers (no injection)."""
+    try:
+        n = int(value)
+        if n <= 0:
+            raise ValueError
+        return n
+    except (ValueError, TypeError):
+        raise serializers.ValidationError("Invalid ID parameter.")
+
+
+Apply no_html() as a validator on all CharField and TextField
+serializer fields that accept user input:
+
+  first_name = serializers.CharField(validators=[no_html])
+  last_name  = serializers.CharField(validators=[no_html])
+
+The ORM already prevents SQL injection for all parameterized queries.
+Extra sanitization is defense-in-depth.
+
+
+────────────────────────────────────────────────────────────────────
+17.7 — SENSITIVE DATA MASKING IN LOGS (config/settings/base.py)
+────────────────────────────────────────────────────────────────────
+
+Ensure that passwords, tokens and emails are NEVER written to logs.
+Add a custom log filter:
+
+# core/logging_filters.py
+import logging
+import re
+
+class SensitiveDataFilter(logging.Filter):
+    PATTERNS = [
+        (re.compile(r'"password"\s*:\s*"[^"]*"'), '"password": "***"'),
+        (re.compile(r'"token"\s*:\s*"[^"]*"'),    '"token": "***"'),
+        (re.compile(r'Bearer\s+[A-Za-z0-9._-]+'), 'Bearer ***'),
+    ]
+
+    def filter(self, record):
+        msg = str(record.getMessage())
+        for pattern, replacement in self.PATTERNS:
+            msg = pattern.sub(replacement, msg)
+        record.msg = msg
+        return True
+
+Add to LOGGING in base.py:
+  "filters": {
+      "sensitive": {"()": "core.logging_filters.SensitiveDataFilter"}
+  },
+  # Apply to all handlers
+
+
+────────────────────────────────────────────────────────────────────
+17.8 — AUDIT LOG RETROACTIVE IMPROVEMENTS (apps/safex/api/views.py)
+────────────────────────────────────────────────────────────────────
+
+Add write_log() calls to the Safex data layer views:
+
+In CompanyDetailView:
+  def retrieve(self, request, *args, **kwargs):
+      instance = self.get_object()
+      write_log(
+          user=request.user, action="COMPANY_VIEWED",
+          entity_type="Company", entity_id=instance.id,
+          details={"endpoint": "detail"}, ip_address=_get_ip(request),
+      )
+      return super().retrieve(request, *args, **kwargs)
+
+In DocumentListView / DocumentDetailView:
+  Add similar write_log() on GET requests for sensitive documents.
+
+In GlobalSearchView:
+  write_log(user, "DATA_EXPORTED", "Search", None, {"query": query})
+
+
+────────────────────────────────────────────────────────────────────
+17.9 — NGINX SECURITY HEADERS (infrastructure/nginx/nginx.conf)
+────────────────────────────────────────────────────────────────────
+
+Add to the server block (in addition to existing headers):
+
+  add_header X-Content-Type-Options     "nosniff"            always;
+  add_header X-Frame-Options            "DENY"               always;
+  add_header X-XSS-Protection           "1; mode=block"      always;
+  add_header Referrer-Policy            "strict-origin"      always;
+  add_header Permissions-Policy         "geolocation=(), camera=(), microphone=()";
+  add_header Content-Security-Policy    "default-src 'self'" always;
+
+  # Hide server version
+  server_tokens off;
+
+  # Block access to hidden files (.env, .git etc.)
+  location ~ /\. {
+      deny all;
+      return 404;
+  }
+
+  # Limit request body to 5MB (prevents large payload attacks)
+  client_max_body_size 5m;
+
+  # Limit request methods
+  limit_except GET POST PATCH DELETE {
+      deny all;
+  }
+
+
+────────────────────────────────────────────────────────────────────
+17.10 — CELERY TASK SECURITY
+────────────────────────────────────────────────────────────────────
+
+In base.py:
+  # Limit task execution time
+  CELERY_TASK_TIME_LIMIT      = 300    # 5 minutes hard limit
+  CELERY_TASK_SOFT_TIME_LIMIT = 240    # 4 minutes soft limit (raises exception)
+
+  # Never pass sensitive data in task arguments (use user_id not password)
+  # BAD:  send_email.delay(user_email, raw_password)
+  # GOOD: send_email.delay(user_id, token_id)   ← fetch from DB inside task
+
+  # Only accept tasks from trusted sources
+  CELERY_ACCEPT_CONTENT = ["json"]   # never pickle (code execution risk)
+  CELERY_TASK_SERIALIZER = "json"
+
+
+────────────────────────────────────────────────────────────────────
+17.11 — GUNICORN PRODUCTION HARDENING (entrypoint.sh)
+────────────────────────────────────────────────────────────────────
+
+exec gunicorn config.wsgi:application \
+  --bind 0.0.0.0:8000 \
+  --workers 4 \
+  --worker-class gthread \
+  --threads 2 \
+  --timeout 120 \
+  --graceful-timeout 30 \
+  --keep-alive 5 \
+  --limit-request-line 4094 \       # limit URL length
+  --limit-request-fields 100 \      # limit number of headers
+  --limit-request-field-size 8190 \ # limit header size
+  --access-logfile - \
+  --error-logfile  - \
+  --log-level warning               # info in dev, warning in prod
+
+
+────────────────────────────────────────────────────────────────────
+17.12 — DEPENDENCY SECURITY SCANNING
+────────────────────────────────────────────────────────────────────
+
+Add to CI/CD pipeline or run manually before each deployment:
+
+  pip install pip-audit safety
+
+  # Check for known CVEs in all dependencies
+  pip-audit -r requirements/production.txt
+
+  # Alternative scanner
+  safety check -r requirements/production.txt
+
+  # Check Django security settings
+  python manage.py check --deploy --settings=config.settings.production
+
+All must return 0 vulnerabilities before deploying.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 18 — TEST SUITE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# ── apps/users/tests/factories.py ────────────────────────────────────
+
+import factory
+from factory.django import DjangoModelFactory
+from faker import Faker
+from apps.users.models import Role, UserSector, User, UserSession, UserClient
+
+fake = Faker()
+
+
+class RoleFactory(DjangoModelFactory):
+    class Meta:
+        model = Role
+        django_get_or_create = ("name",)
+    name = "viewer"
+
+
+class UserSectorFactory(DjangoModelFactory):
+    class Meta:
+        model = UserSector
+    name = factory.Sequence(lambda n: f"Sector {n}")
+
+
+class UserFactory(DjangoModelFactory):
+    class Meta:
+        model = User
+    first_name = factory.LazyAttribute(lambda _: fake.first_name())
+    last_name  = factory.LazyAttribute(lambda _: fake.last_name())
+    email      = factory.Sequence(lambda n: f"user{n}@temacina.com")
+    phone      = factory.LazyAttribute(lambda _: fake.phone_number()[:20])
+    role       = factory.SubFactory(RoleFactory)
+    is_active  = True
+    password   = factory.PostGenerationMethodCall("set_password", "SecurePass1!")
+
+
+class AdminFactory(UserFactory):
+    role = factory.SubFactory(RoleFactory, name="admin")
+
+
+class ManagerFactory(UserFactory):
+    role = factory.SubFactory(RoleFactory, name="manager")
+
+
+class UserSessionFactory(DjangoModelFactory):
+    class Meta:
+        model = UserSession
+    user       = factory.SubFactory(UserFactory)
+    ip_address = factory.LazyAttribute(lambda _: fake.ipv4())
+    is_active  = True
+
+
+# ── apps/users/tests/test_models.py ──────────────────────────────────
+
+import pytest
+from django.db import IntegrityError
+from apps.users.tests.factories import (
+    UserFactory, RoleFactory, AdminFactory, ManagerFactory, UserSessionFactory
+)
+from apps.users.models import User, UserClient
+
+
+@pytest.mark.django_db
+class TestUserModel:
+
+    def test_create_user_with_hashed_password(self):
+        user = UserFactory()
+        assert user.id is not None
+        assert user.password != "SecurePass1!"        # must be hashed
+        assert user.check_password("SecurePass1!")    # hash is valid
+
+    def test_email_unique_constraint(self):
+        UserFactory(email="dup@test.com")
+        with pytest.raises(IntegrityError):
+            UserFactory(email="dup@test.com")
+
+    def test_full_name_property(self):
+        user = UserFactory(first_name="Ali", last_name="Benali")
+        assert user.full_name == "Ali Benali"
+
+    def test_role_name_property(self):
+        role = RoleFactory(name="manager")
+        user = UserFactory(role=role)
+        assert user.role_name == "manager"
+
+    def test_self_referential_manager(self):
+        manager  = ManagerFactory()
+        employee = UserFactory(manager=manager)
+        assert employee.manager.id == manager.id
+        assert employee in list(manager.direct_reports.all())
+
+    def test_get_reportees_recursive(self):
+        manager = ManagerFactory()
+        r1 = UserFactory(manager=manager)
+        r2 = UserFactory(manager=manager)
+        r3 = UserFactory(manager=r1)   # nested
+        all_reports = manager.get_reportees()
+        ids = [u.id for u in all_reports]
+        assert r1.id in ids
+        assert r2.id in ids
+        assert r3.id in ids
+
+    def test_deactivated_user_excluded_from_active_queryset(self):
+        user = UserFactory(is_active=False)
+        from apps.users.services.user import UserService
+        result = UserService.get_all()
+        assert user not in list(result)
+
+
+@pytest.mark.django_db
+class TestRoleHierarchy:
+
+    def test_admin_is_above_manager(self):
+        admin_role = RoleFactory(name="admin")
+        assert admin_role.is_above("manager") is True
+
+    def test_viewer_not_above_analyst(self):
+        viewer_role = RoleFactory(name="viewer")
+        assert viewer_role.is_above("analyst") is False
+
+    def test_superadmin_is_above_all(self):
+        sa = RoleFactory(name="superadmin")
+        for r in ["admin", "manager", "analyst", "viewer"]:
+            assert sa.is_above(r) is True
+
+
+@pytest.mark.django_db
+class TestPasswordResetToken:
+    def test_token_generated_and_hashed(self):
+        import hashlib
+        from apps.authentication.models import PasswordResetToken
+        user  = UserFactory()
+        raw   = PasswordResetToken.generate(user=user)
+        h     = hashlib.sha256(raw.encode()).hexdigest()
+        token = PasswordResetToken.objects.get(token_hash=h)
+        assert token.is_valid is True
+        assert token.used_at  is None
+
+    def test_token_expires_correctly(self):
+        from django.utils import timezone
+        from datetime import timedelta
+        from apps.authentication.models import PasswordResetToken
+        user  = UserFactory()
+        raw   = PasswordResetToken.generate(user=user)
+        token = PasswordResetToken.objects.get(
+            token_hash=__import__("hashlib").sha256(raw.encode()).hexdigest()
+        )
+        token.expires_at = timezone.now() - timedelta(seconds=1)
+        token.save()
+        assert token.is_valid is False
+
+    def test_previous_tokens_invalidated_on_new_generate(self):
+        from apps.authentication.models import PasswordResetToken
+        user = UserFactory()
+        PasswordResetToken.generate(user=user)  # first
+        PasswordResetToken.generate(user=user)  # second (should invalidate first)
+        valid_count = PasswordResetToken.objects.filter(
+            user=user, used_at=None
+        ).count()
+        assert valid_count == 1  # only the latest is valid
+
+
+# ── apps/authentication/tests/test_services.py ───────────────────────
+
+import pytest
+from unittest.mock import patch
+from apps.users.tests.factories import UserFactory
+from apps.authentication.services import AuthService
+
+
+@pytest.mark.django_db
+class TestAuthServiceLogin:
+
+    def test_successful_login_returns_tokens(self):
+        user = UserFactory()
+        result = AuthService.login(
+            email=user.email, password="SecurePass1!",
+            ip="127.0.0.1", user_agent="TestAgent",
+        )
+        assert "access"     in result
+        assert "refresh"    in result
+        assert "session_id" in result
+        assert result["user"]["email"] == user.email
+
+    def test_wrong_password_raises_value_error(self):
+        user = UserFactory()
+        with pytest.raises(ValueError, match="Invalid email or password"):
+            AuthService.login(
+                email=user.email, password="WrongPass!1",
+                ip="127.0.0.1", user_agent="",
+            )
+
+    def test_inactive_user_raises_permission_error(self):
+        user = UserFactory(is_active=False)
+        with pytest.raises(PermissionError, match="deactivated"):
+            AuthService.login(
+                email=user.email, password="SecurePass1!",
+                ip="127.0.0.1", user_agent="",
+            )
+
+    def test_session_created_on_login(self):
+        from apps.users.models import UserSession
+        user = UserFactory()
+        AuthService.login(user.email, "SecurePass1!", "1.2.3.4", "")
+        assert UserSession.objects.filter(user=user, is_active=True).exists()
+
+    def test_lockout_after_5_failures(self):
+        from apps.authentication.throttles import AccountLockoutMixin
+        from django.core.cache import cache
+        cache.clear()
+        user = UserFactory()
+        for _ in range(5):
+            try:
+                AuthService.login(user.email, "BadPass!99", "1.2.3.4", "")
+            except ValueError:
+                pass
+        with pytest.raises(PermissionError, match="locked"):
+            AuthService.login(user.email, "SecurePass1!", "1.2.3.4", "")
+
+    def test_lockout_cleared_on_success(self):
+        from apps.authentication.throttles import AccountLockoutMixin
+        from django.core.cache import cache
+        cache.clear()
+        user = UserFactory()
+        # 2 failures then success → lockout should clear
+        for _ in range(2):
+            try:
+                AuthService.login(user.email, "Bad!Pass99", "1.2.3.4", "")
+            except ValueError:
+                pass
+        result = AuthService.login(user.email, "SecurePass1!", "1.2.3.4", "")
+        assert "access" in result
+        assert AccountLockoutMixin.is_locked(user.email) is False
+
+
+@pytest.mark.django_db
+class TestPasswordResetFlow:
+
+    def test_request_reset_always_returns_true_for_unknown_email(self):
+        result = AuthService.request_password_reset(
+            email="unknown@nowhere.com", ip="1.2.3.4"
+        )
+        assert result is True   # never leaks user existence
+
+    @patch("apps.authentication.email.send_password_reset_email.delay")
+    def test_request_reset_dispatches_celery_task(self, mock_delay):
+        user = UserFactory()
+        AuthService.request_password_reset(email=user.email, ip="1.2.3.4")
+        mock_delay.assert_called_once()
+
+    def test_reset_password_with_valid_token(self):
+        from apps.authentication.models import PasswordResetToken
+        user  = UserFactory()
+        token = PasswordResetToken.generate(user=user)
+        result = AuthService.reset_password(
+            raw_token=token, new_password="NewSecure!99", ip="1.2.3.4"
+        )
+        assert result is True
+        user.refresh_from_db()
+        assert user.check_password("NewSecure!99") is True
+
+    def test_reset_password_invalidates_sessions(self):
+        from apps.authentication.models import PasswordResetToken
+        from apps.users.models import UserSession
+        user = UserFactory()
+        UserSession.objects.create(user=user, ip_address="1.2.3.4", is_active=True)
+        token = PasswordResetToken.generate(user=user)
+        AuthService.reset_password(token, "NewSecure!99", "1.2.3.4")
+        active = UserSession.objects.filter(user=user, is_active=True).count()
+        assert active == 0
+
+    def test_reset_with_invalid_token_raises(self):
+        with pytest.raises(ValueError, match="Invalid or expired"):
+            AuthService.reset_password("faktoken123", "NewPass!99", "1.2.3.4")
+
+    def test_reset_with_used_token_raises(self):
+        from apps.authentication.models import PasswordResetToken
+        user  = UserFactory()
+        raw   = PasswordResetToken.generate(user=user)
+        # Use it once
+        AuthService.reset_password(raw, "FirstNew!99", "1.2.3.4")
+        # Try to use again
+        with pytest.raises(ValueError):
+            AuthService.reset_password(raw, "SecondNew!99", "1.2.3.4")
+
+
+# ── apps/users/tests/test_api.py ─────────────────────────────────────
+
+import pytest
+from rest_framework.test import APIClient
+from apps.users.tests.factories import (
+    UserFactory, AdminFactory, ManagerFactory, RoleFactory
+)
+
+
+@pytest.fixture
+def viewer_client():
+    user = UserFactory(role=RoleFactory(name="viewer"))
+    user.set_password("SecurePass1!")
+    user.save()
+    client = APIClient()
+    resp = APIClient().post("/api/v1/auth/login/",
+                            {"email": user.email, "password": "SecurePass1!"},
+                            format="json")
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['data']['access']}")
+    return client, user
+
+
+@pytest.fixture
+def admin_client():
+    user = AdminFactory()
+    user.set_password("SecurePass1!")
+    user.save()
+    client = APIClient()
+    resp = APIClient().post("/api/v1/auth/login/",
+                            {"email": user.email, "password": "SecurePass1!"},
+                            format="json")
+    client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['data']['access']}")
+    return client, user
+
+
+@pytest.mark.django_db
+class TestLoginAPI:
+
+    def test_login_success(self):
+        user = UserFactory()
+        user.set_password("SecurePass1!")
+        user.save()
+        resp = APIClient().post("/api/v1/auth/login/",
+                                {"email": user.email, "password": "SecurePass1!"},
+                                format="json")
+        assert resp.status_code == 200
+        assert "access"  in resp.data["data"]
+        assert "refresh" in resp.data["data"]
+
+    def test_login_wrong_password_returns_401(self):
+        user = UserFactory()
+        resp = APIClient().post("/api/v1/auth/login/",
+                                {"email": user.email, "password": "WrongPass!9"},
+                                format="json")
+        assert resp.status_code == 401
+
+    def test_login_missing_fields_returns_400(self):
+        resp = APIClient().post("/api/v1/auth/login/", {}, format="json")
+        assert resp.status_code == 400
+
+    def test_logout_blacklists_token(self):
+        user = UserFactory()
+        user.set_password("SecurePass1!")
+        user.save()
+        login_resp = APIClient().post("/api/v1/auth/login/",
+                                     {"email": user.email, "password": "SecurePass1!"},
+                                     format="json")
+        client = APIClient()
+        client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {login_resp.data['data']['access']}"
+        )
+        logout_resp = client.post("/api/v1/auth/logout/",
+                                  {"refresh": login_resp.data["data"]["refresh"]},
+                                  format="json")
+        assert logout_resp.status_code == 204
+
+
+@pytest.mark.django_db
+class TestPasswordResetAPI:
+
+    def test_reset_request_always_200(self):
+        resp = APIClient().post("/api/v1/auth/password/reset/",
+                                {"email": "notexist@nowhere.com"},
+                                format="json")
+        assert resp.status_code == 200
+
+    def test_reset_confirm_invalid_token_400(self):
+        resp = APIClient().post("/api/v1/auth/password/reset/confirm/",
+                                {"token": "badtoken", "new_password": "NewPass!99"},
+                                format="json")
+        assert resp.status_code == 400
+
+    def test_reset_confirm_weak_password_400(self):
+        from apps.authentication.models import PasswordResetToken
+        user  = UserFactory()
+        token = PasswordResetToken.generate(user=user)
+        resp  = APIClient().post("/api/v1/auth/password/reset/confirm/",
+                                 {"token": token, "new_password": "weak"},
+                                 format="json")
+        assert resp.status_code == 400
+
+
+@pytest.mark.django_db
+class TestUserManagementAPI:
+
+    def test_me_returns_own_profile(self, viewer_client):
+        client, user = viewer_client
+        resp = client.get("/api/v1/users/me/")
+        assert resp.status_code == 200
+        assert resp.data["data"]["email"] == user.email
+
+    def test_viewer_cannot_list_all_users(self, viewer_client):
+        client, _ = viewer_client
+        resp = client.get("/api/v1/users/")
+        assert resp.status_code == 403
+
+    def test_admin_can_list_all_users(self, admin_client):
+        client, _ = admin_client
+        UserFactory.create_batch(3)
+        resp = client.get("/api/v1/users/")
+        assert resp.status_code == 200
+        assert len(resp.data["data"]) >= 3
+
+    def test_admin_can_create_user(self, admin_client):
+        client, _ = admin_client
+        role = RoleFactory(name="viewer")
+        resp = client.post("/api/v1/users/", {
+            "first_name": "Test",
+            "last_name":  "User",
+            "email":      "newuser@test.com",
+            "password":   "SecurePass!99",
+            "role_id":    role.id,
+        }, format="json")
+        assert resp.status_code == 201
+        assert resp.data["data"]["email"] == "newuser@test.com"
+
+    def test_admin_cannot_create_user_with_higher_role(self, admin_client):
+        client, _ = admin_client
+        sa_role = RoleFactory(name="superadmin")
+        resp = client.post("/api/v1/users/", {
+            "first_name": "Bad",
+            "last_name":  "Actor",
+            "email":      "bad@test.com",
+            "password":   "SecurePass!99",
+            "role_id":    sa_role.id,
+        }, format="json")
+        assert resp.status_code == 403
+
+    def test_unauthenticated_request_returns_401(self):
+        resp = APIClient().get("/api/v1/users/me/")
+        assert resp.status_code == 401
+
+    def test_change_role_success(self, admin_client):
+        client, _ = admin_client
+        user = UserFactory(role=RoleFactory(name="viewer"))
+        analyst_role = RoleFactory(name="analyst")
+        resp = client.post(f"/api/v1/users/{user.id}/role/",
+                           {"role": "analyst"}, format="json")
+        assert resp.status_code == 200
+
+    def test_deactivate_user(self, admin_client):
+        client, _ = admin_client
+        user = UserFactory(role=RoleFactory(name="viewer"))
+        resp = client.delete(f"/api/v1/users/{user.id}/")
+        assert resp.status_code == 204
+        user.refresh_from_db()
+        assert user.is_active is False
+
+    def test_assign_company_to_user(self, admin_client):
+        from apps.safex.tests.factories import CompanyFactory
+        client, _ = admin_client
+        user    = UserFactory()
+        company = CompanyFactory()
+        resp = client.post(f"/api/v1/users/{user.id}/companies/assign/",
+                           {"company_id": company.id}, format="json")
+        assert resp.status_code == 201
+
+    def test_viewer_only_sees_assigned_companies(self, viewer_client):
+        from apps.safex.tests.factories import CompanyFactory
+        from apps.users.models import UserClient
+        client, user = viewer_client
+        company = CompanyFactory()
+        UserClient.objects.create(user=user, company_id=company.id)
+        resp = client.get(f"/api/v1/users/{user.id}/companies/")
+        assert resp.status_code == 200
+        ids = [c["id"] for c in resp.data["data"]]
+        assert company.id in ids
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 19 — RUNNING ALL TESTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Full test suite (all apps)
+pytest --cov=apps --cov-report=term-missing -v
+
+# Auth only
+pytest apps/authentication/tests/ -v
+
+# Users only
+pytest apps/users/tests/ -v
+
+# Security checks before deploy
+python manage.py check --deploy --settings=config.settings.production
+pip-audit -r requirements/production.txt
+
+# Expected results:
+#   apps/users/tests/test_models.py      ........ [12 tests]
+#   apps/users/tests/test_api.py         ........ [14 tests]
+#   apps/authentication/tests/           ........ [12 tests]
+#   ─────────────────────────────────────────────────────────
+#   TOTAL: 38 tests | 0 failed | Coverage target ≥ 85%
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 20 — COMPLETE IMPLEMENTATION ORDER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+STEP 1   Run the 6 CREATE TABLE statements on Neon (Part 2)
+         Verify tables exist: SELECT table_name FROM information_schema.tables
+         WHERE table_schema = 'public';
+
+STEP 2   Write apps/users/managers.py
+         Write apps/users/models.py          (Role, UserSector, User,
+                                              UserSession, UserClient)
+         Write apps/audit/models.py          (AuditLog managed=False)
+         Write apps/authentication/models.py (PasswordResetToken managed=True)
+         Update AUTH_USER_MODEL = "users.User" in base.py
+
+STEP 3   python manage.py migrate            ← creates password_reset_tokens
+         python manage.py migrate --fake-initial ← fakes the Neon tables
+         python manage.py createsuperuser
+
+STEP 4   Write apps/users/validators.py
+         Write apps/users/permissions.py
+         Write apps/authentication/throttles.py
+         Write core/logging_filters.py
+         Apply all settings changes (Part 17)
+
+STEP 5   Write apps/audit/services.py        (write_log helper)
+         Write apps/users/services/user.py
+         Write apps/authentication/services.py
+         Write apps/authentication/email.py  (Celery task)
+
+STEP 6   Write all serializers, views, url files
+         Register all URLs in config/urls.py
+
+STEP 7   Write factories.py for all new models
+         Write test_models.py → pytest apps/users/tests/test_models.py
+         Write test_services.py → pytest apps/authentication/tests/
+         Write test_api.py → pytest apps/users/tests/test_api.py
+
+STEP 8   python manage.py check --deploy --settings=config.settings.production
+         pip-audit -r requirements/production.txt
+         All must pass before going to Step 9
+
+STEP 9   Update Nginx config with new security headers (Part 17.9)
+         Update docker-compose Redis with password (Part 17.3)
+         Rebuild containers: docker-compose up --build
+
+STEP 10  Smoke test every endpoint manually (Postman or curl)
+         Verify audit_logs are written for: login, logout,
+         password reset, user creation, company assignment
+
+STEP 11  Connect frontend
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 21 — CONFTEST.PY UPDATE FOR NEW MANAGED=FALSE TABLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The existing conftest.py at the project root only created Safex tables.
+Extend it to also create the new user management tables so all
+managed=False models work in tests.
+
+# ── conftest.py  (project root — full replacement) ───────────────────
+
+import pytest
+from django.db import connection
+
+
+@pytest.fixture(scope="session")
+def django_db_setup(django_db_setup, django_db_blocker):
+    """
+    Creates ALL managed=False tables before the test session starts.
+    Covers: Safex data layer + user management + audit layer.
+    The PasswordResetToken table IS managed=True, so Django's own
+    test runner creates it automatically via migrate.
+    """
+    from django.apps import apps
+
+    UNMANAGED_APPS = ["safex", "users", "audit"]
+
+    with django_db_blocker.unblock():
+        with connection.schema_editor() as editor:
+            for app_label in UNMANAGED_APPS:
+                try:
+                    app_config = apps.get_app_config(app_label)
+                except LookupError:
+                    continue
+                for model in app_config.get_models():
+                    if not model._meta.managed:
+                        try:
+                            editor.create_model(model)
+                        except Exception:
+                            pass  # table may already exist; safe to ignore
+
+    # Seed the minimum required reference data
+    with django_db_blocker.unblock():
+        _seed_roles()
+
+
+def _seed_roles():
+    """
+    Role and lookup tables must be pre-populated because
+    UserFactory depends on a Role existing.
+    This mirrors the INSERT statements from Part 2.
+    """
+    from apps.users.models import Role
+    for name in ["viewer", "analyst", "manager", "admin", "superadmin"]:
+        Role.objects.get_or_create(name=name)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 22 — ADMIN REGISTRATION  (apps/users/admin.py & apps/audit/admin.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Register all new models so you can inspect live Neon data from
+the Django admin panel during development and debugging.
+
+# ── apps/users/admin.py ──────────────────────────────────────────────
+
+from django.contrib import admin
+from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
+from apps.users.models import (
+    Role, UserSector, User, UserSession, UserClient
+)
+from apps.authentication.models import PasswordResetToken
+
+
+@admin.register(User)
+class UserAdmin(BaseUserAdmin):
+    list_display   = ["email", "full_name", "role", "sector",
+                      "is_active", "created_at"]
+    list_filter    = ["role", "sector", "is_active"]
+    search_fields  = ["email", "first_name", "last_name"]
+    ordering       = ["-created_at"]
+    readonly_fields = ["created_at", "last_login"]
+    raw_id_fields  = ["manager"]
+
+    fieldsets = (
+        ("Identity",     {"fields": ("first_name", "last_name",
+                                     "email", "phone")}),
+        ("Access",       {"fields": ("role", "sector", "manager",
+                                     "is_active", "is_staff")}),
+        ("Security",     {"fields": ("password", "last_login", "created_at")}),
+    )
+    add_fieldsets = (
+        (None, {
+            "classes": ("wide",),
+            "fields":  ("email", "first_name", "last_name",
+                        "role", "password1", "password2"),
+        }),
+    )
+
+    # Prevent admins from editing superadmin accounts
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        if not request.user.is_superuser:
+            qs = qs.exclude(role__name="superadmin")
+        return qs
+
+    def has_delete_permission(self, request, obj=None):
+        # Never hard-delete users from admin panel; use deactivate instead
+        return False
+
+
+@admin.register(Role)
+class RoleAdmin(admin.ModelAdmin):
+    list_display = ["id", "name"]
+    search_fields = ["name"]
+
+
+@admin.register(UserSector)
+class UserSectorAdmin(admin.ModelAdmin):
+    list_display  = ["id", "name"]
+    search_fields = ["name"]
+
+
+@admin.register(UserSession)
+class UserSessionAdmin(admin.ModelAdmin):
+    list_display   = ["user", "login_at", "logout_at", "ip_address", "is_active"]
+    list_filter    = ["is_active"]
+    search_fields  = ["user__email", "ip_address"]
+    date_hierarchy = "login_at"
+    readonly_fields = ["user", "login_at", "logout_at", "ip_address",
+                       "user_agent", "is_active"]
+
+    def has_add_permission(self, request):
+        return False   # sessions are created by code, never manually
+
+
+@admin.register(UserClient)
+class UserClientAdmin(admin.ModelAdmin):
+    list_display  = ["user", "company_id", "assigned_at"]
+    search_fields = ["user__email"]
+    raw_id_fields = ["user"]
+
+
+@admin.register(PasswordResetToken)
+class PasswordResetTokenAdmin(admin.ModelAdmin):
+    list_display   = ["user", "created_at", "expires_at", "used_at"]
+    list_filter    = ["used_at"]
+    search_fields  = ["user__email"]
+    readonly_fields = ["user", "token_hash", "created_at",
+                       "expires_at", "used_at", "ip_address"]
+
+    def has_add_permission(self, request):
+        return False   # tokens are created by the auth service only
+
+    def has_change_permission(self, request, obj=None):
+        return False   # read-only audit tool
+
+
+# ── apps/audit/admin.py ──────────────────────────────────────────────
+
+from django.contrib import admin
+from apps.audit.models import AuditLog
+
+
+@admin.register(AuditLog)
+class AuditLogAdmin(admin.ModelAdmin):
+    list_display   = ["action_type", "user", "entity_type",
+                      "entity_id", "ip_address", "created_at"]
+    list_filter    = ["action_type", "entity_type"]
+    search_fields  = ["user__email", "action_type", "entity_type", "ip_address"]
+    date_hierarchy = "created_at"
+    readonly_fields = ["user", "action_type", "entity_type",
+                       "entity_id", "details", "ip_address", "created_at"]
+
+    def has_add_permission(self, request):
+        return False   # audit logs are immutable
+
+    def has_change_permission(self, request, obj=None):
+        return False   # audit logs are immutable
+
+    def has_delete_permission(self, request, obj=None):
+        return False   # audit logs are immutable
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 23 — COMPLETE ROOT URL CONFIGURATION  (config/urls.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Full replacement of config/urls.py with all apps registered.
+This is the single source of truth for every route in the system.
+
+# ── config/urls.py ───────────────────────────────────────────────────
+
+from django.contrib import admin
+from django.urls import path, include
+from django.conf import settings
+
+# Rename admin URL to something non-obvious (security hardening)
+admin.site.site_header = "Temacina Administration"
+admin.site.site_title  = "Temacina Admin"
+
+urlpatterns = [
+    # ── Django admin (obscured path) ──────────────────────────────
+    path("secure-admin-temacina/", admin.site.urls),
+
+    # ── Health check (public, no auth required) ───────────────────
+    path("api/health/", include("health_check.urls")),
+
+    # ── Authentication ─────────────────────────────────────────────
+    # POST /api/v1/auth/login/
+    # POST /api/v1/auth/logout/
+    # POST /api/v1/auth/refresh/
+    # POST /api/v1/auth/password/change/
+    # POST /api/v1/auth/password/reset/
+    # POST /api/v1/auth/password/reset/confirm/
+    path("api/v1/auth/", include("apps.authentication.api.urls")),
+
+    # ── User management ────────────────────────────────────────────
+    # GET/PATCH /api/v1/users/me/
+    # GET/POST  /api/v1/users/
+    # GET/PATCH/DELETE /api/v1/users/{id}/
+    # POST      /api/v1/users/{id}/role/
+    # GET       /api/v1/users/{id}/reports/
+    # GET       /api/v1/users/{id}/sessions/
+    # GET/POST  /api/v1/users/{id}/companies/
+    # GET       /api/v1/users/roles/
+    # GET       /api/v1/users/sectors/
+    path("api/v1/users/", include("apps.users.api.urls")),
+
+    # ── Safex data layer ───────────────────────────────────────────
+    # GET  /api/v1/trade-shows/
+    # GET  /api/v1/companies/
+    # GET  /api/v1/documents/
+    # GET  /api/v1/dashboard/kpis/
+    # GET  /api/v1/search/
+    path("api/v1/", include("apps.safex.api.urls")),
+]
+
+if settings.DEBUG:
+    import debug_toolbar
+    urlpatterns = [
+        path("__debug__/", include(debug_toolbar.urls)),
+    ] + urlpatterns
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 24 — SETTINGS ADDITIONS (config/settings/base.py additions)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Add or update these blocks in base.py to wire everything together.
+
+# ── Auth model override ───────────────────────────────────────────────
+AUTH_USER_MODEL = "users.User"
+
+# ── Custom auth backend (email login instead of username) ────────────
+AUTHENTICATION_BACKENDS = [
+    "apps.authentication.backends.EmailBackend",
+]
+
+# ── apps/authentication/backends.py ─────────────────────────────────
+from django.contrib.auth.backends import ModelBackend
+from apps.users.models import User
+
+class EmailBackend(ModelBackend):
+    def authenticate(self, request, username=None, password=None, **kwargs):
+        email = username or kwargs.get("email")
+        if not email:
+            return None
+        try:
+            user = User.objects.get(email__iexact=email, is_active=True)
+        except User.DoesNotExist:
+            # Run password hasher anyway to mitigate timing attacks
+            User().set_password(password)
+            return None
+        if user.check_password(password):
+            return user
+        return None
+# ── end backend ─────────────────────────────────────────────────────
+
+# ── Password validators ───────────────────────────────────────────────
+AUTH_PASSWORD_VALIDATORS = [
+    {"NAME": "apps.users.validators.StrongPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+     "OPTIONS": {"min_length": 10}},
+]
+
+# ── Password hashing (bcrypt first, Argon2 fallback) ─────────────────
+# pip install bcrypt argon2-cffi
+PASSWORD_HASHERS = [
+    "django.contrib.auth.hashers.BCryptSHA256PasswordHasher",
+    "django.contrib.auth.hashers.Argon2PasswordHasher",
+    "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+]
+
+# ── Email ─────────────────────────────────────────────────────────────
+EMAIL_HOST          = config("EMAIL_HOST",          default="smtp.sendgrid.net")
+EMAIL_PORT          = config("EMAIL_PORT",          default=587, cast=int)
+EMAIL_HOST_USER     = config("EMAIL_HOST_USER",     default="apikey")
+EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="")
+EMAIL_USE_TLS       = True
+DEFAULT_FROM_EMAIL  = config("DEFAULT_FROM_EMAIL",  default="noreply@temacina.com")
+FRONTEND_URL        = config("FRONTEND_URL",        default="http://localhost:3000")
+
+# ── Add migration for PasswordResetToken ─────────────────────────────
+# apps/authentication/migrations/0001_initial.py is auto-generated by:
+# python manage.py makemigrations authentication
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 25 — AUDIT MIDDLEWARE UPDATE  (apps/audit/middleware.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The old audit middleware (from Phase 8 of the original roadmap)
+used a naive model. Replace it with one that uses the new AuditLog
+model and write_log() helper, and skips writing for trivial paths.
+
+# ── apps/audit/middleware.py (full replacement) ───────────────────────
+
+import uuid
+
+SKIP_PREFIXES = (
+    "/api/health/",
+    "/static/",
+    "/media/",
+    "/__debug__/",
+    "/secure-admin-temacina/",
+)
+
+SENSITIVE_ACTIONS = {
+    "POST":   "CREATE",
+    "PATCH":  "UPDATE",
+    "PUT":    "UPDATE",
+    "DELETE": "DELETE",
+    "GET":    None,   # GETs logged selectively by views, not middleware
+}
+
+
+class AuditMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if any(request.path.startswith(p) for p in SKIP_PREFIXES):
+            return self.get_response(request)
+
+        request.request_id = str(uuid.uuid4())
+        response = self.get_response(request)
+
+        # Only log mutating requests (POST/PATCH/PUT/DELETE) from middleware.
+        # GET audit is handled explicitly inside views for sensitive endpoints.
+        action_label = SENSITIVE_ACTIONS.get(request.method)
+        if action_label and 200 <= response.status_code < 300:
+            from apps.audit.services import write_log
+            user = request.user if request.user.is_authenticated else None
+            write_log(
+                user=user,
+                action=action_label,
+                entity_type=_entity_from_path(request.path),
+                entity_id=_entity_id_from_path(request.path),
+                details={"method": request.method,
+                         "path":   request.path,
+                         "status": response.status_code},
+                ip_address=_get_ip(request),
+            )
+        elif response.status_code == 403:
+            from apps.audit.services import write_log
+            user = request.user if request.user.is_authenticated else None
+            write_log(
+                user=user,
+                action="ACCESS_DENIED",
+                entity_type=_entity_from_path(request.path),
+                entity_id=None,
+                details={"method": request.method, "path": request.path},
+                ip_address=_get_ip(request),
+            )
+
+        return response
+
+
+def _get_ip(request):
+    xff = request.META.get("HTTP_X_FORWARDED_FOR")
+    return xff.split(",")[0].strip() if xff else request.META.get("REMOTE_ADDR")
+
+
+def _entity_from_path(path: str) -> str:
+    parts = [p for p in path.strip("/").split("/") if p and not p.isdigit()]
+    return parts[-1].upper() if parts else "UNKNOWN"
+
+
+def _entity_id_from_path(path: str) -> "int | None":
+    parts = path.strip("/").split("/")
+    for p in reversed(parts):
+        if p.isdigit():
+            return int(p)
+    return None
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 26 — FRONTEND INTEGRATION (Authentication Flow)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This section documents exactly how the frontend should consume
+each auth endpoint. Implement this once the backend is ready.
+
+────────────────────────────────────────────────────────────
+26.1 — TOKEN STORAGE STRATEGY
+────────────────────────────────────────────────────────────
+
+NEVER store JWTs in localStorage (XSS vulnerable).
+Use one of these two approaches:
+
+  Option A (Recommended): httpOnly cookies
+    → Backend sets the access token as a Secure + httpOnly cookie.
+    → Frontend sends credentials with every request automatically.
+    → JavaScript cannot read the cookie at all.
+
+  Option B (Acceptable for internal dashboards):
+    → Store access token in memory (JS variable, Zustand, Redux).
+    → Store refresh token in sessionStorage (cleared on tab close).
+    → Never in localStorage.
+
+For this dashboard, Option B is acceptable because it's
+an authenticated internal tool, not a public-facing product.
+
+
+────────────────────────────────────────────────────────────
+26.2 — AUTH CLIENT (JavaScript)
+────────────────────────────────────────────────────────────
+
+const API = "https://api.temacina.com/api/v1"
+
+// In-memory token store (not localStorage)
+let _accessToken  = null
+let _refreshToken = null  // or sessionStorage for persistence
+
+const setTokens = ({ access, refresh }) => {
+  _accessToken  = access
+  _refreshToken = refresh || null
+}
+
+const clearTokens = () => {
+  _accessToken  = null
+  _refreshToken = null
+}
+
+// ── Core fetch wrapper ─────────────────────────────────────
+const apiFetch = async (path, options = {}) => {
+  const headers = {
+    "Content-Type": "application/json",
+    ...(options.headers || {}),
+  }
+  if (_accessToken) {
+    headers["Authorization"] = `Bearer ${_accessToken}`
+  }
+
+  let resp = await fetch(`${API}${path}`, { ...options, headers })
+
+  // Access token expired → try refresh
+  if (resp.status === 401 && _refreshToken) {
+    const refreshed = await _refreshAccessToken()
+    if (refreshed) {
+      headers["Authorization"] = `Bearer ${_accessToken}`
+      resp = await fetch(`${API}${path}`, { ...options, headers })
+    } else {
+      clearTokens()
+      window.location.href = "/login"
+      return
+    }
+  }
+  const json = await resp.json()
+  if (!json.success) throw new Error(json.errors?.detail || "Request failed")
+  return json.data
+}
+
+// ── Refresh access token ───────────────────────────────────
+const _refreshAccessToken = async () => {
+  if (!_refreshToken) return false
+  try {
+    const resp = await fetch(`${API}/auth/refresh/`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ refresh: _refreshToken }),
+    })
+    const json = await resp.json()
+    if (resp.ok && json.data?.access) {
+      _accessToken = json.data.access
+      return true
+    }
+    return false
+  } catch {
+    return false
+  }
+}
+
+
+────────────────────────────────────────────────────────────
+26.3 — AUTH FLOWS (JavaScript)
+────────────────────────────────────────────────────────────
+
+// ── LOGIN ─────────────────────────────────────────────────
+const login = async (email, password) => {
+  const resp = await fetch(`${API}/auth/login/`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ email, password }),
+  })
+  const json = await resp.json()
+
+  if (!json.success) {
+    // Show json.errors.detail to the user
+    throw new Error(json.errors?.detail || "Login failed")
+  }
+
+  setTokens(json.data)          // store tokens in memory
+  return json.data.user         // { id, full_name, email, role, sector }
+}
+
+// ── LOGOUT ────────────────────────────────────────────────
+const logout = async () => {
+  try {
+    await apiFetch("/auth/logout/", {
+      method: "POST",
+      body:   JSON.stringify({ refresh: _refreshToken }),
+    })
+  } finally {
+    clearTokens()
+    window.location.href = "/login"
+  }
+}
+
+// ── FORGOT PASSWORD — Step 1: Request reset email ─────────
+const requestPasswordReset = async (email) => {
+  const resp = await fetch(`${API}/auth/password/reset/`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ email }),
+  })
+  const json = await resp.json()
+  // Always show the same message to user regardless of response
+  return "If this email is registered, a reset link has been sent."
+}
+
+// ── FORGOT PASSWORD — Step 2: Confirm reset with token ────
+// The token comes from the URL: /reset-password?token=abc123
+const confirmPasswordReset = async (token, newPassword) => {
+  const resp = await fetch(`${API}/auth/password/reset/confirm/`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ token, new_password: newPassword }),
+  })
+  const json = await resp.json()
+  if (!json.success) throw new Error(json.errors?.detail || "Reset failed")
+  return json.data.detail  // "Password reset successful. Please log in."
+}
+
+// ── CHANGE PASSWORD (authenticated) ───────────────────────
+const changePassword = async (oldPassword, newPassword) => {
+  return apiFetch("/auth/password/change/", {
+    method: "POST",
+    body:   JSON.stringify({
+      old_password: oldPassword,
+      new_password: newPassword,
+    }),
+  })
+}
+
+
+────────────────────────────────────────────────────────────
+26.4 — ROLE-BASED UI RENDERING
+────────────────────────────────────────────────────────────
+
+// After login, the user object contains the role.
+// Use it to show or hide UI elements.
+
+const currentUser = await login(email, password)
+// currentUser.role → "viewer" | "analyst" | "manager" | "admin" | "superadmin"
+
+const HIERARCHY = ["viewer", "analyst", "manager", "admin", "superadmin"]
+
+const hasRole = (requiredRole) => {
+  return (
+    HIERARCHY.indexOf(currentUser.role) >=
+    HIERARCHY.indexOf(requiredRole)
+  )
+}
+
+// Usage in React (example):
+// {hasRole("admin") && <UserManagementPanel />}
+// {hasRole("analyst") && <ExportButton />}
+// {hasRole("viewer") && <DashboardWidget />}
+
+// IMPORTANT: Role checks on the frontend are for UX only.
+// The backend enforces real access control on every request.
+// Never trust frontend-only permission checks for security.
+
+
+────────────────────────────────────────────────────────────
+26.5 — USER MANAGEMENT API CALLS
+────────────────────────────────────────────────────────────
+
+// List all users (admin+)
+const listUsers = (filters = {}) => {
+  const params = new URLSearchParams(filters).toString()
+  return apiFetch(`/users/?${params}`)
+}
+
+// Get own profile
+const getMe = () => apiFetch("/users/me/")
+
+// Update own profile
+const updateMe = (data) => apiFetch("/users/me/", {
+  method: "PATCH",
+  body:   JSON.stringify(data),
+})
+
+// Create a new user (admin+)
+const createUser = (data) => apiFetch("/users/", {
+  method: "POST",
+  body:   JSON.stringify(data),
+})
+
+// Change a user's role (admin+)
+const changeUserRole = (userId, role) => apiFetch(`/users/${userId}/role/`, {
+  method: "POST",
+  body:   JSON.stringify({ role }),
+})
+
+// Assign a company to a user (admin+)
+const assignCompany = (userId, companyId) =>
+  apiFetch(`/users/${userId}/companies/assign/`, {
+    method: "POST",
+    body:   JSON.stringify({ company_id: companyId }),
+  })
+
+// Get assigned companies for a user
+const getUserCompanies = (userId) =>
+  apiFetch(`/users/${userId}/companies/`)
+
+// Get login session history (admin+)
+const getUserSessions = (userId) =>
+  apiFetch(`/users/${userId}/sessions/`)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 27 — COMPLETE SYSTEM ENDPOINT MAP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Every single endpoint in the Temacina backend — old + new.
+
+METHOD  ENDPOINT                                    ROLE        THROTTLE
+───────────────────────────────────────────────────────────────────────────
+# ── System ────────────────────────────────────────────────────────────
+GET     /api/health/                                Public      None
+
+# ── Authentication ─────────────────────────────────────────────────────
+POST    /api/v1/auth/login/                         Public      5/min per IP
+POST    /api/v1/auth/logout/                        Any         2000/hour
+POST    /api/v1/auth/refresh/                       Public      100/hour
+POST    /api/v1/auth/password/change/               Any         2000/hour
+POST    /api/v1/auth/password/reset/                Public      3/hour per IP
+POST    /api/v1/auth/password/reset/confirm/        Public      3/hour per IP
+
+# ── Profile ────────────────────────────────────────────────────────────
+GET     /api/v1/users/me/                           Viewer+     2000/hour
+PATCH   /api/v1/users/me/                           Viewer+     2000/hour
+
+# ── User Management ─────────────────────────────────────────────────────
+GET     /api/v1/users/                              Admin+      2000/hour
+POST    /api/v1/users/                              Admin+      2000/hour
+GET     /api/v1/users/roles/                        Admin+      2000/hour
+GET     /api/v1/users/sectors/                      Viewer+     2000/hour
+GET     /api/v1/users/{id}/                         Manager+    2000/hour
+PATCH   /api/v1/users/{id}/                         Admin+      2000/hour
+DELETE  /api/v1/users/{id}/                         Admin+      2000/hour
+POST    /api/v1/users/{id}/role/                    Admin+      2000/hour
+GET     /api/v1/users/{id}/reports/                 Manager+    2000/hour
+GET     /api/v1/users/{id}/sessions/                Admin+      2000/hour
+GET     /api/v1/users/{id}/companies/               Manager+    2000/hour
+POST    /api/v1/users/{id}/companies/assign/        Admin+      2000/hour
+
+# ── Safex — Trade Shows ───────────────────────────────────────────────
+GET     /api/v1/trade-shows/                        Viewer+     2000/hour
+GET     /api/v1/trade-shows/{id}/                   Viewer+     2000/hour
+GET     /api/v1/trade-shows/{id}/stats/             Viewer+     2000/hour
+GET     /api/v1/trade-shows/{id}/ingestion-progress/Viewer+     2000/hour
+GET     /api/v1/sectors/                            Viewer+     2000/hour
+
+# ── Safex — Companies ─────────────────────────────────────────────────
+GET     /api/v1/companies/                          Viewer+     2000/hour
+GET     /api/v1/companies/?trade_show_id={id}       Viewer+     2000/hour
+GET     /api/v1/companies/?year={year}              Viewer+     2000/hour
+GET     /api/v1/companies/?sector_id={id}           Viewer+     2000/hour
+GET     /api/v1/companies/?country={country}        Viewer+     2000/hour
+GET     /api/v1/companies/?search={name}            Viewer+     2000/hour
+GET     /api/v1/companies/count-per-trade-show/     Viewer+     2000/hour
+GET     /api/v1/companies/{id}/                     CanAccess   2000/hour
+GET     /api/v1/companies/{id}/profile/             CanAccess   2000/hour
+GET     /api/v1/companies/{id}/phones/              CanAccess   2000/hour
+GET     /api/v1/companies/{id}/emails/              CanAccess   2000/hour
+
+# ── Safex — Documents ─────────────────────────────────────────────────
+GET     /api/v1/documents/                          Analyst+    2000/hour
+GET     /api/v1/documents/{id}/                     Analyst+    2000/hour
+
+# ── Dashboard ─────────────────────────────────────────────────────────
+GET     /api/v1/dashboard/kpis/                     Viewer+     2000/hour
+
+# ── Search ────────────────────────────────────────────────────────────
+GET     /api/v1/search/?q={query}                   Viewer+     2000/hour
+
+TOTAL: 39 endpoints
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 28 — COMPLETE SECURITY CHECKLIST (Pre-deployment Gate)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Run this checklist before every production deployment.
+Nothing goes live until every box is checked.
+
+Authentication & Sessions
+  [ ] JWT access token lifetime ≤ 15 minutes
+  [ ] Refresh token rotated on every use
+  [ ] Token blacklist active and tested
+  [ ] Session row created on login, closed on logout
+  [ ] Account lockout triggers after 5 failed logins
+  [ ] Lockout clears correctly on successful login
+  [ ] Password reset token expires after 1 hour
+  [ ] Password reset token is SHA-256 hashed in DB (never plain text)
+  [ ] Old reset tokens invalidated when new one is generated
+  [ ] Forgot-password endpoint returns same response for known/unknown emails
+  [ ] All sessions invalidated when password is reset
+  [ ] Auth backend uses constant-time password comparison
+
+Passwords
+  [ ] Minimum 10 characters enforced
+  [ ] Uppercase, lowercase, digit, special char required
+  [ ] BCrypt used as primary hasher
+  [ ] Weak/common passwords rejected
+  [ ] Password never logged anywhere
+
+Authorization
+  [ ] Role hierarchy enforced: viewer < analyst < manager < admin < superadmin
+  [ ] Admin cannot create/edit users with equal or higher role
+  [ ] CanAccessCompany: viewers/analysts only see assigned companies
+  [ ] Every view has explicit permission_classes declared
+  [ ] Unauthenticated requests return 401 (not 403 or 200)
+
+Network & Transport
+  [ ] HTTPS enforced (SECURE_SSL_REDIRECT=True)
+  [ ] HSTS header set (31536000 seconds, includeSubDomains)
+  [ ] All cookies are Secure + HttpOnly + SameSite=Strict
+  [ ] CORS allows only the dashboard origin (not *)
+  [ ] Nginx request body limited to 5MB
+  [ ] Admin URL changed from /admin/ to obscured path
+
+Headers
+  [ ] X-Frame-Options: DENY
+  [ ] X-Content-Type-Options: nosniff
+  [ ] Content-Security-Policy set
+  [ ] Referrer-Policy: strict-origin
+  [ ] server_tokens off in Nginx
+
+Database
+  [ ] Neon connection uses sslmode=require
+  [ ] statement_timeout=30s enforced
+  [ ] lock_timeout=10s enforced
+  [ ] Read-only Neon role used for analytics queries
+  [ ] Superuser credentials NOT used by the application
+
+Cache & Queue
+  [ ] Redis bound to 127.0.0.1 only (not publicly accessible)
+  [ ] Redis password set (requirepass)
+  [ ] Celery accepts JSON only (no pickle)
+  [ ] Celery task time limit set (300s hard)
+  [ ] Sensitive data never passed as Celery task arguments
+
+Audit & Observability
+  [ ] Every login/logout written to audit_logs
+  [ ] Every failed login attempt written to audit_logs
+  [ ] Password reset requests and completions logged
+  [ ] Role changes logged
+  [ ] Company assignment changes logged
+  [ ] 403 responses logged as ACCESS_DENIED
+  [ ] Sentry DSN configured and receiving events
+  [ ] No passwords, tokens, or emails written to log files
+
+Code & Dependencies
+  [ ] python manage.py check --deploy returns 0 issues
+  [ ] pip-audit returns 0 known CVEs
+  [ ] safety check passes
+  [ ] DEBUG=False in production
+  [ ] SECRET_KEY ≥ 50 chars, random, not the Django default
+  [ ] ALLOWED_HOSTS explicitly set (no wildcard *)
+  [ ] All secrets come from environment variables (none in code)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 29 — FINAL COMPLETE IMPLEMENTATION ORDER (ALL PHASES)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This is the authoritative A→Z order combining the original backend,
+the Safex data layer, and this user/auth/security layer.
+
+━━━ ALREADY DONE (IMPLEMENTATION_ROADMAP.md) ━━━━━━━━━━━━━━━━━━━━━━━
+  Phase 0     Project scaffold, .env, folder structure
+  Phase 1     Requirements files
+  Phase 2     Settings (base/dev/prod/test)
+  Phase 3     Core utilities (renderer, exceptions, pagination)
+  Phase 4     Root URL config
+  Phase 5.1–5.7  Users app skeleton (now replaced by this file)
+  [5.8 blocked by firewall — pending]
+
+━━━ ALREADY DONE (SAFEX_DATA_LAYER_ROADMAP.txt) ━━━━━━━━━━━━━━━━━━━━
+  Phase 6A    apps/safex models (32 tables, managed=False)
+  Phase 6B    apps/safex services (company, trade_show, analytics, search)
+  Phase 6C    apps/safex serializers, filters, views, urls
+  Phase 6D    apps/safex tests (70 tests)
+
+━━━ THIS FILE — DO IN THIS ORDER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  STEP A    Run SQL on Neon (Part 2)
+              → CREATE: roles, user_sectors, users, user_sessions,
+                        user_clients, audit_logs
+            Verify: psql → \dt  shows all 6 new tables
+
+  STEP B    Replace apps/users/ entirely:
+              → managers.py, models.py, validators.py, permissions.py
+            Replace apps/audit/ entirely:
+              → models.py, services.py, middleware.py
+            Create apps/authentication/models.py
+              → PasswordResetToken (managed=True)
+
+  STEP C    Update config/settings/base.py:
+              → AUTH_USER_MODEL, AUTHENTICATION_BACKENDS,
+                AUTH_PASSWORD_VALIDATORS, PASSWORD_HASHERS,
+                EMAIL_*, FRONTEND_URL, THROTTLE_RATES
+            Create apps/authentication/backends.py
+
+  STEP D    python manage.py makemigrations authentication
+            python manage.py migrate             ← creates password_reset_tokens
+            python manage.py migrate --fake-initial  ← fakes Neon tables
+            python manage.py check               ← must pass
+
+  STEP E    Write security layer:
+              → apps/authentication/throttles.py
+              → core/logging_filters.py
+              → apps/users/validators.py (already in STEP B)
+            Test validators:
+              python manage.py shell
+              >>> from apps.users.validators import StrongPasswordValidator
+              >>> StrongPasswordValidator().validate("weak")   # should raise
+
+  STEP F    Write service layer:
+              → apps/audit/services.py           (write_log helper)
+              → apps/users/services/user.py      (CRUD, role change)
+              → apps/authentication/services.py  (login, logout, reset)
+              → apps/authentication/email.py     (Celery task)
+            Test in shell:
+              >>> from apps.authentication.services import AuthService
+              >>> AuthService.request_password_reset("test@test.com", "127.0.0.1")
+
+  STEP G    Write API layer:
+              → apps/authentication/api/serializers.py + views.py + urls.py
+              → apps/users/api/serializers.py + views.py + urls.py
+            Update config/urls.py (Part 23)
+
+  STEP H    Write admin files:
+              → apps/users/admin.py
+              → apps/audit/admin.py
+            Visit /secure-admin-temacina/ → verify all models visible
+
+  STEP I    Update conftest.py (Part 21)
+            Write test factories (Part 18 factories.py)
+            pytest --collect-only    ← must collect all tests without errors
+
+  STEP J    Run tests in layers:
+              pytest apps/users/tests/test_models.py -v        ← all pass
+              pytest apps/authentication/tests/test_services.py -v
+              pytest apps/users/tests/test_api.py -v
+              pytest apps/safex/tests/ -v   ← must still pass (regression)
+
+  STEP K    Full test suite + coverage:
+              pytest --cov=apps --cov-report=term-missing
+              Target: ≥ 85% coverage across all apps
+
+  STEP L    Security hardening:
+              Apply Part 17 settings changes
+              Update Nginx conf (Part 17.9)
+              Update Redis docker-compose (Part 17.3)
+              Install and run: pip-audit + safety
+              python manage.py check --deploy   ← 0 issues
+
+  STEP M    Docker rebuild:
+              docker-compose up --build
+              curl https://yourdomain.com/api/health/   ← all green
+
+  STEP N    Smoke test every auth endpoint:
+              POST /api/v1/auth/login/        → get tokens
+              GET  /api/v1/users/me/          → own profile
+              POST /api/v1/auth/password/reset/→ check email received
+              POST /api/v1/auth/password/reset/confirm/ → new password works
+              POST /api/v1/auth/logout/       → token blacklisted
+
+  STEP O    Run Part 28 security checklist — all boxes checked
+
+  STEP P    Connect frontend (Part 26)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUICK REFERENCE — KEY FILES CHANGED OR CREATED IN THIS PHASE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  NEW FILES
+  ─────────────────────────────────────────────────────────────────
+  apps/users/managers.py
+  apps/users/validators.py
+  apps/users/permissions.py
+  apps/users/models.py                       (full replacement)
+  apps/users/admin.py                        (full replacement)
+  apps/users/services/user.py
+  apps/users/api/serializers.py              (full replacement)
+  apps/users/api/views.py                    (full replacement)
+  apps/users/api/urls.py                     (full replacement)
+  apps/users/tests/factories.py
+  apps/users/tests/test_models.py
+  apps/users/tests/test_services.py
+  apps/users/tests/test_api.py
+  apps/authentication/models.py              (PasswordResetToken)
+  apps/authentication/backends.py            (EmailBackend)
+  apps/authentication/services.py            (full replacement)
+  apps/authentication/email.py               (Celery email task)
+  apps/authentication/throttles.py
+  apps/authentication/api/serializers.py     (full replacement)
+  apps/authentication/api/views.py           (full replacement)
+  apps/authentication/api/urls.py            (full replacement)
+  apps/authentication/tests/test_services.py
+  apps/authentication/tests/test_api.py
+  apps/audit/models.py                       (full replacement)
+  apps/audit/services.py
+  apps/audit/middleware.py                   (full replacement)
+  apps/audit/admin.py
+  core/logging_filters.py
+
+  MODIFIED FILES
+  ─────────────────────────────────────────────────────────────────
+  config/urls.py                             (all routes registered)
+  config/settings/base.py                   (auth, email, hashers, throttle)
+  config/settings/production.py             (CSP, cookie hardening)
+  infrastructure/nginx/nginx.conf            (security headers)
+  infrastructure/docker-compose.yml          (Redis password)
+  conftest.py                               (new managed=False tables)

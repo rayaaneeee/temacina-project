@@ -1,17 +1,29 @@
+# Test factories for creating test objects
 import factory
-from factory.django import DjangoModelFactory
-from faker import Faker
-from apps.users.models import User
+from apps.users.models import User, Role, UserSector
 
-fake = Faker()
 
-class UserFactory(DjangoModelFactory):
+class RoleFactory(factory.django.DjangoModelFactory):
+    class Meta:
+        model = Role
+
+    name = factory.Faker('word')
+
+
+class UserSectorFactory(factory.django.DjangoModelFactory):
+    class Meta:
+        model = UserSector
+
+    name = factory.Faker('word')
+
+
+class UserFactory(factory.django.DjangoModelFactory):
     class Meta:
         model = User
 
-    email      = factory.LazyAttribute(lambda _: fake.unique.email())
-    first_name = factory.LazyAttribute(lambda _: fake.first_name())
-    last_name  = factory.LazyAttribute(lambda _: fake.last_name())
-    password   = factory.PostGenerationMethodCall("set_password", "testpass123")
-    is_active  = True
-    role       = User.Role.ANALYST
+    first_name = factory.Faker('first_name')
+    last_name = factory.Faker('last_name')
+    email = factory.Faker('email')
+    password = factory.PostGenerationMethodCall('set_password', 'Test@1234')
+    role = factory.SubFactory(RoleFactory)
+    is_active = True
