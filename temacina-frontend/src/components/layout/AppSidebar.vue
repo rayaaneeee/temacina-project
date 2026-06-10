@@ -2,13 +2,9 @@
   <aside class="w-48 flex-shrink-0 bg-white border-r border-gray-200 flex flex-col h-full">
 
     <!-- Logo -->
-    <div class="h-16 flex items-center px-4 border-b border-gray-100 gap-2">
-      <div class="w-9 h-9 bg-orange-500 rounded-lg flex items-center justify-center flex-shrink-0">
-        <span class="text-white font-black text-sm">T</span>
-      </div>
-      <div>
-        <div class="text-sm font-bold text-gray-800 leading-none">TEMACINA</div>
-        <div class="text-[10px] text-gray-400">.COM</div>
+    <div class="flex items-center gap-2 px-4 py-4 border-b border-gray-100">
+      <div class="w-full shrink-0 flex items-center justify-center">
+         <img src="@/assets/temacina.png" />
       </div>
     </div>
 
