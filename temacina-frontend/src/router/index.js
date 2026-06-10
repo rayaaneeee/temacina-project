@@ -12,7 +12,7 @@ const routes = [
     path: '/',
     component: AuthLayout,
     children: [
-      { path: '', redirect: '/login' },
+      { path: '', redirect: '/app/help' },
       { path: 'login', name: 'login', component: LoginView, meta: { guestOnly: true } },
       { path: 'forgot-password', name: 'forgot-password', component: ForgotPasswordView, meta: { guestOnly: true } },
       { path: 'reset-password', name: 'reset-password', component: ResetPasswordView, meta: { guestOnly: true } },
@@ -28,6 +28,9 @@ const routes = [
       { path: 'profile', name: 'profile', component: () => import('@/views/ProfileView.vue') },
 
       { path: 'users-management', name: 'users-management', component: () => import('@/views/UsersManagementView.vue') },
+      { path: 'help', name: 'help', component: () => import('@/views/HelpView.vue') },
+      //{ path: 'trade-shows', name: 'trade-shows', component: () => import('@/views/TradeShowsView.vue') },
+      //{ path: 'documentation', name: 'documentation', component: () => import('@/views/DocumentsPageView.vue') }
     ],
   },
   { path: '/:pathMatch(.*)*', name: 'not-found', component: () => import('@/views/NotFoundView.vue') },
