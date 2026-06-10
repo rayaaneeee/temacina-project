@@ -29,18 +29,6 @@
 
     <!-- Bottom: user + logout -->
     <div class="border-t border-gray-100 p-3 space-y-1">
-      <RouterLink to="/app/profile"
-        class="flex items-center gap-2 px-2 py-2 rounded-lg hover:bg-gray-50 cursor-pointer">
-        <div class="w-7 h-7 rounded-full bg-orange-100 flex items-center justify-center flex-shrink-0">
-          <span class="text-orange-600 font-bold text-xs">
-            {{ initial }}
-          </span>
-        </div>
-        <div class="min-w-0">
-          <div class="text-xs font-semibold text-gray-700 truncate">{{ authStore.userName }}</div>
-          <div class="text-[10px] text-gray-400 capitalize">{{ authStore.userRole }}</div>
-        </div>
-      </RouterLink>
       <button
         @click="handleLogout"
         class="flex items-center gap-2 px-2 py-2 rounded-lg hover:bg-red-50
@@ -59,6 +47,8 @@ import { useAuthStore } from '@/stores/auth'
 import {
   LayoutDashboard, Building2, Users, CalendarDays,
   FileText, Globe, BarChart3, Download, Settings, LogOut, User,
+  Users2,
+  HelpCircle,
 } from '@lucide/vue'
 
 const authStore = useAuthStore()
@@ -76,13 +66,11 @@ async function handleLogout() {
 const navItems = [
   { label: 'Tableau de bord',     to: '/app/dashboard',   icon: LayoutDashboard },
   { label: 'Entreprises',         to: '/app/companies',   icon: Building2 },
-  { label: 'Contacts',            to: '/app/contacts',    icon: Users },
   { label: "Salons d'exposition", to: '/app/trade-shows', icon: CalendarDays },
   { label: 'Supports',            to: '/app/supports',    icon: FileText },
-  { label: 'Pays',                to: '/app/countries',   icon: Globe },
   { label: 'Analyses',            to: '/app/analytics',   icon: BarChart3 },
-  { label: 'Exports',             to: '/app/exports',     icon: Download },
-  { label: 'Paramètres',          to: '/app/settings',    icon: Settings },
   { label: 'Profil',              to: '/app/profile',     icon: User },
+  { label: 'Gestion utilisateurs',   to: '/app/users-management',     icon: Users  },
+  { label: 'Aide',   to: '/app/help',     icon: HelpCircle  },
 ]
 </script>
