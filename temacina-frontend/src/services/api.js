@@ -32,7 +32,9 @@ api.interceptors.response.use(
   },
   async (error) => {
     const original = error.config
-    if (error.response?.status === 401 && !original._retry) {
+    // Never attempt token refresh for auth endpoints (login, refresh, etc.)
+    const isAuthEndpoint = original.url?.includes('/auth/')
+    if (error.response?.status === 401 && !original._retry && !isAuthEndpoint) {
       if (isRefreshing) {
         return new Promise((resolve, reject) => {
           failedQueue.push({ resolve, reject })
@@ -64,11 +66,14 @@ api.interceptors.response.use(
         isRefreshing = false
       }
     }
+    const errors = error.response?.data?.errors
     const message =
-      error.response?.data?.errors?.detail ||
+      (errors && typeof errors === 'object' && !Array.isArray(errors)
+        ? errors.detail ?? Object.values(errors).flat().join(' ')
+        : null) ||
       error.response?.data?.detail ||
       error.message ||
-      'Une erreur est survenue'
+      'An error occurred'
     return Promise.reject(new Error(message))
   },
 )
