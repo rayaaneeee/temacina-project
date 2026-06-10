@@ -29,6 +29,7 @@ const routes = [
 
       { path: 'users-management', name: 'users-management', component: () => import('@/views/UsersManagementView.vue') },
       { path: 'help', name: 'help', component: () => import('@/views/HelpView.vue') },
+      { path: 'analytics', name: 'analytics', component: () => import('@/views/AnalyticsView.vue') },
       //{ path: 'trade-shows', name: 'trade-shows', component: () => import('@/views/TradeShowsView.vue') },
       //{ path: 'documentation', name: 'documentation', component: () => import('@/views/DocumentsPageView.vue') }
     ],
