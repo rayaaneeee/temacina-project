@@ -370,7 +370,7 @@ import { useDebounceFn } from '@vueuse/core'
 import {
   UserPlus, Search, X, Users, Pencil, ShieldCheck, Trash2,
   ChevronLeft, ChevronRight, AlertTriangle,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import { useUsersStore } from '@/stores/users'
 import { usePermissions } from '@/composables/userpermissions'
 import dayjs from 'dayjs'
