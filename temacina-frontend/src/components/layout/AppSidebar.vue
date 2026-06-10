@@ -1,5 +1,5 @@
 <template>
-  <aside class="w-48 flex-shrink-0 bg-white border-r border-gray-200 flex flex-col h-full">
+  <aside class="w-52 flex-shrink-0 bg-white border-r border-gray-200 flex flex-col h-full">
 
     <!-- Logo -->
     <div class="flex items-center gap-2 px-4 py-4 border-b border-gray-100">
@@ -9,39 +9,55 @@
     </div>
 
     <!-- Nav -->
-    <nav class="flex-1 py-4 px-3 space-y-1 overflow-y-auto">
-      <RouterLink
-        v-for="item in navItems"
-        :key="item.name"
-        :to="item.to"
-        custom
-        v-slot="{ isActive, navigate }"
-      >
-        <button
-          @click="navigate"
-          :class="['nav-item w-full', isActive ? 'active' : '']"
+    <nav class="flex-1 py-4 px-3 overflow-y-auto">
+      <p class="text-[10px] font-semibold text-gray-400 uppercase tracking-widest px-2 mb-2">
+        Main Menu
+      </p>
+      <div class="space-y-0.5">
+        <RouterLink
+          v-for="item in navItems"
+          :key="item.label"
+          :to="item.to"
+          custom
+          v-slot="{ isActive, navigate }"
         >
-          <component :is="item.icon" class="w-4 h-4 flex-shrink-0" />
-          <span class="truncate text-xs">{{ item.label }}</span>
-        </button>
-      </RouterLink>
+          <button
+            @click="navigate"
+            :class="[
+              'flex items-center gap-3 w-full px-3 py-2 rounded-lg text-sm transition-colors',
+              isActive
+                ? 'bg-orange-500 text-white font-semibold'
+                : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
+            ]"
+          >
+            <component :is="item.icon" class="w-4 h-4 flex-shrink-0" />
+            <span class="truncate">{{ item.label }}</span>
+          </button>
+        </RouterLink>
+      </div>
     </nav>
 
-    <!-- Bottom: user + logout -->
-    <div class="border-t border-gray-100 p-3 space-y-1">
+    <!-- Bottom: Profile + Logout -->
+    <div class="border-t border-gray-100 p-3 space-y-0.5">
+      <RouterLink to="/app/profile"
+        class="flex items-center gap-3 px-3 py-2 rounded-lg text-sm
+               text-gray-600 hover:bg-gray-100 hover:text-gray-900 transition-colors">
+        <User class="w-4 h-4 flex-shrink-0" />
+        <span>Profile</span>
+      </RouterLink>
       <button
         @click="handleLogout"
-        class="flex items-center gap-2 px-2 py-2 rounded-lg hover:bg-red-50
-               text-gray-500 hover:text-red-500 w-full transition-colors">
+        class="flex items-center gap-3 px-3 py-2 rounded-lg w-full text-sm
+               text-gray-500 hover:bg-red-50 hover:text-red-500 transition-colors">
         <LogOut class="w-4 h-4" />
-        <span class="text-xs font-medium">Déconnexion</span>
+        <span>Logout</span>
       </button>
     </div>
+
   </aside>
 </template>
 
 <script setup>
-import { computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import {
@@ -54,24 +70,21 @@ import {
 const authStore = useAuthStore()
 const router    = useRouter()
 
-const initial = computed(() =>
-  authStore.userName ? authStore.userName.charAt(0).toUpperCase() : 'U'
-)
-
 async function handleLogout() {
   await authStore.logout()
   router.push({ name: 'login' })
 }
 
-const ALL_ITEMS = [
-  { label: 'Tableau de bord',      to: '/app/dashboard',        icon: LayoutDashboard, minRole: 'viewer'    },
-  { label: 'Entreprises',          to: '/app/companies',        icon: Building2,        minRole: 'analyst'   },
-  { label: "Salons d'exposition",  to: '/app/trade-shows',      icon: CalendarDays,     minRole: 'analyst'   },
-  { label: 'Supports',             to: '/app/supports',         icon: FileText,         minRole: 'analyst'   },
-  { label: 'Analyses',             to: '/app/analytics',        icon: BarChart3,        minRole: 'analyst'   },
-  { label: 'Profil',               to: '/app/profile',          icon: User,             minRole: 'viewer'    },
-  { label: 'Gestion utilisateurs', to: '/app/users-management', icon: Users,            minRole: 'admin'     },
-  { label: 'Aide',                 to: '/app/help',             icon: HelpCircle,       minRole: 'viewer'    },
+const navItems = [
+  { label: 'Dashboard',   to: '/app/dashboard',   icon: LayoutDashboard },
+  { label: 'Companies',   to: '/app/companies',   icon: Building2 },
+  { label: 'Contacts',    to: '/app/contacts',    icon: Users },
+  { label: 'Trade Shows', to: '/app/trade-shows', icon: CalendarDays },
+  { label: 'Documents',   to: '/app/supports',    icon: FileText },
+  { label: 'Countries',   to: '/app/countries',   icon: Globe },
+  { label: 'Analytics',   to: '/app/analytics',   icon: BarChart3 },
+  { label: 'Exports',     to: '/app/exports',     icon: Download },
+  { label: 'Settings',    to: '/app/settings',    icon: Settings },
 ]
 
 const navItems = computed(() =>
