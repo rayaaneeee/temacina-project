@@ -64,7 +64,6 @@ import { useAuthStore } from '@/stores/auth'
 import {
   LayoutDashboard, Building2, Users, CalendarDays,
   FileText, Globe, BarChart3, Download, Settings, LogOut, User,
-  HelpCircle,
 } from '@lucide/vue'
 
 const authStore = useAuthStore()
@@ -85,7 +84,6 @@ const ALL_ITEMS = [
   { label: 'Analytics',   to: '/app/analytics',   icon: BarChart3,       minRole: 'analyst' },
   { label: 'Exports',     to: '/app/exports',     icon: Download,        minRole: 'analyst' },
   { label: 'Settings',    to: '/app/settings',    icon: Settings,        minRole: 'admin'   },
-  { label: 'Help',        to: '/app/help',        icon: HelpCircle,      minRole: 'viewer'  },
 ]
 
 const navItems = computed(() =>
